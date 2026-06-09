@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Glacier.Grep.Host/Glacier.Grep.Host.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Glacier.Grep.Tests/Glacier.Grep.Tests.csproj" />
+  </Folder>
+  <Project Path="src/Glacier.Grep/Glacier.Grep.csproj" />
+</Solution>
