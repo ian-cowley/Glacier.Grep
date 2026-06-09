@@ -16,6 +16,8 @@ namespace Glacier.Grep
         private readonly bool _searchHidden;
         private readonly int? _maxDepth;
         private readonly Dictionary<string, List<GitIgnoreFile>> _ignoreFileCache = new(StringComparer.OrdinalIgnoreCase);
+        private string? _cachedDir;
+        private List<GitIgnoreFile>? _cachedIgnoreFiles;
 
         public DirectoryTraverser(string rootDir, bool searchHidden = false, int? maxDepth = null)
         {
@@ -66,7 +68,6 @@ namespace Glacier.Grep
                 _rootDir,
                 (ref FileSystemEntry entry) => new FileSearchTask(
                     entry.ToFullPath(),
-                    Path.GetRelativePath(_rootDir, entry.ToFullPath()),
                     entry.Length
                 ),
                 options
@@ -86,7 +87,7 @@ namespace Glacier.Grep
             ReadOnlySpan<char> fileName = entry.FileName;
 
             // Fast stack-allocated filters for common noisy folders/files
-            if (!_searchHidden && fileName.StartsWith("."))
+            if (!_searchHidden && fileName.StartsWith('.'))
             {
                 return false;
             }
@@ -99,16 +100,40 @@ namespace Glacier.Grep
                 return false;
             }
 
-            // Perform full ignore check
-            string fullPath = entry.ToFullPath();
-            return !IsIgnored(fullPath, isDirectory: false);
+            // Normalize path using stack-allocated span
+            ReadOnlySpan<char> dir = entry.Directory;
+            int totalLen = dir.Length + 1 + fileName.Length;
+            char[]? rented = null;
+            Span<char> pathBuffer = totalLen <= 1024 ? stackalloc char[1024] : (rented = System.Buffers.ArrayPool<char>.Shared.Rent(totalLen));
+            Span<char> normalizedPath = pathBuffer.Slice(0, totalLen);
+
+            dir.CopyTo(normalizedPath);
+            normalizedPath[dir.Length] = '/';
+            fileName.CopyTo(normalizedPath.Slice(dir.Length + 1));
+
+            for (int i = 0; i < dir.Length; i++)
+            {
+                if (normalizedPath[i] == '\\')
+                {
+                    normalizedPath[i] = '/';
+                }
+            }
+
+            bool ignored = IsIgnored(normalizedPath, isDirectory: false);
+
+            if (rented != null)
+            {
+                System.Buffers.ArrayPool<char>.Shared.Return(rented);
+            }
+
+            return !ignored;
         }
 
         private bool ShouldRecurseEntry(ref FileSystemEntry entry)
         {
             ReadOnlySpan<char> dirName = entry.FileName;
 
-            if (!_searchHidden && dirName.StartsWith("."))
+            if (!_searchHidden && dirName.StartsWith('.'))
             {
                 return false;
             }
@@ -133,52 +158,118 @@ namespace Glacier.Grep
                 return false;
             }
 
-            string fullPath = entry.ToFullPath();
+            // Normalize path using stack-allocated span
+            ReadOnlySpan<char> dir = entry.Directory;
+            int totalLen = dir.Length + 1 + dirName.Length;
+            char[]? rented = null;
+            Span<char> pathBuffer = totalLen <= 1024 ? stackalloc char[1024] : (rented = System.Buffers.ArrayPool<char>.Shared.Rent(totalLen));
+            Span<char> normalizedPath = pathBuffer.Slice(0, totalLen);
+
+            dir.CopyTo(normalizedPath);
+            normalizedPath[dir.Length] = '/';
+            dirName.CopyTo(normalizedPath.Slice(dir.Length + 1));
+
+            for (int i = 0; i < dir.Length; i++)
+            {
+                if (normalizedPath[i] == '\\')
+                {
+                    normalizedPath[i] = '/';
+                }
+            }
 
             // Evaluate recursion depth
             if (_maxDepth.HasValue)
             {
-                string relPath = Path.GetRelativePath(_rootDir, fullPath);
-                int depth = relPath.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries).Length;
+                int relStart = _rootDir.Length;
+                if (relStart < normalizedPath.Length && normalizedPath[relStart] == '/')
+                    relStart++;
+                
+                ReadOnlySpan<char> relPath = normalizedPath.Slice(relStart);
+                int depth = 0;
+                if (!relPath.IsEmpty)
+                {
+                    depth = 1;
+                    for (int i = 0; i < relPath.Length; i++)
+                    {
+                        if (relPath[i] == '/')
+                            depth++;
+                    }
+                }
+
                 if (depth > _maxDepth.Value)
+                {
+                    if (rented != null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
                     return false;
+                }
             }
 
             // Evaluate ignore rules for this directory
-            if (IsIgnored(fullPath, isDirectory: true))
+            bool ignored = IsIgnored(normalizedPath, isDirectory: true);
+            if (ignored)
+            {
+                if (rented != null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
                 return false;
+            }
 
             // Dynamically load nested ignore files in this directory
+            string fullPath = normalizedPath.ToString();
             LoadDirectoryIgnoreFiles(fullPath);
+
+            if (rented != null)
+            {
+                System.Buffers.ArrayPool<char>.Shared.Return(rented);
+            }
 
             return true;
         }
 
-        private bool IsIgnored(string fullPath, bool isDirectory)
+        private static ReadOnlySpan<char> GetDirectoryPart(ReadOnlySpan<char> path)
         {
-            string normalizedPath = fullPath.Replace('\\', '/');
+            int lastSlash = path.LastIndexOf('/');
+            return lastSlash < 0 ? ReadOnlySpan<char>.Empty : path.Slice(0, lastSlash);
+        }
 
-            // Evaluate ignore files from the item's directory up to root directory
-            string? currentDir = isDirectory ? normalizedPath : Path.GetDirectoryName(normalizedPath)?.Replace('\\', '/');
-
-            while (currentDir != null)
+        private List<GitIgnoreFile> GetIgnoreFilesForDirectory(ReadOnlySpan<char> dirSpan)
+        {
+            if (_cachedDir != null && dirSpan.Equals(_cachedDir, StringComparison.OrdinalIgnoreCase))
             {
-                if (_ignoreFileCache.TryGetValue(currentDir, out var list))
+                return _cachedIgnoreFiles!;
+            }
+
+            var list = new List<GitIgnoreFile>();
+            var lookup = _ignoreFileCache.GetAlternateLookup<ReadOnlySpan<char>>();
+            ReadOnlySpan<char> currentDir = dirSpan;
+
+            while (!currentDir.IsEmpty)
+            {
+                if (lookup.TryGetValue(currentDir, out var dirIgnoreFiles))
                 {
-                    foreach (var gitignore in list)
-                    {
-                        bool? ignored = gitignore.IsIgnored(normalizedPath, isDirectory);
-                        if (ignored.HasValue)
-                        {
-                            return ignored.Value;
-                        }
-                    }
+                    list.AddRange(dirIgnoreFiles);
                 }
 
                 if (currentDir.Equals(_rootDir, StringComparison.OrdinalIgnoreCase))
                     break;
 
-                currentDir = Path.GetDirectoryName(currentDir)?.Replace('\\', '/');
+                currentDir = GetDirectoryPart(currentDir);
+            }
+
+            _cachedDir = dirSpan.ToString();
+            _cachedIgnoreFiles = list;
+            return list;
+        }
+
+        private bool IsIgnored(ReadOnlySpan<char> normalizedPath, bool isDirectory)
+        {
+            ReadOnlySpan<char> dirSpan = isDirectory ? normalizedPath : GetDirectoryPart(normalizedPath);
+            var ignoreFiles = GetIgnoreFilesForDirectory(dirSpan);
+
+            foreach (var gitignore in ignoreFiles)
+            {
+                bool? ignored = gitignore.IsIgnoredNormalized(normalizedPath, isDirectory);
+                if (ignored.HasValue)
+                {
+                    return ignored.Value;
+                }
             }
 
             return false;

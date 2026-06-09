@@ -147,7 +147,35 @@ namespace Glacier.Grep
         /// </summary>
         public bool? IsIgnored(string fullPath, bool isDirectory)
         {
-            string normalizedFullPath = fullPath.Replace('\\', '/');
+            int totalLen = fullPath.Length;
+            char[]? rented = null;
+            Span<char> normalizedPath = totalLen <= 1024 ? stackalloc char[1024] : (rented = System.Buffers.ArrayPool<char>.Shared.Rent(totalLen));
+            normalizedPath = normalizedPath.Slice(0, totalLen);
+
+            fullPath.AsSpan().CopyTo(normalizedPath);
+            for (int i = 0; i < normalizedPath.Length; i++)
+            {
+                if (normalizedPath[i] == '\\')
+                {
+                    normalizedPath[i] = '/';
+                }
+            }
+
+            bool? result = IsIgnoredNormalized(normalizedPath, isDirectory);
+
+            if (rented != null)
+            {
+                System.Buffers.ArrayPool<char>.Shared.Return(rented);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Evaluates if a given normalized path (with '/' separator) is ignored by this .gitignore file.
+        /// </summary>
+        public bool? IsIgnoredNormalized(ReadOnlySpan<char> normalizedFullPath, bool isDirectory)
+        {
             if (!normalizedFullPath.StartsWith(DirectoryPath, StringComparison.OrdinalIgnoreCase))
                 return null;
 
@@ -155,8 +183,8 @@ namespace Glacier.Grep
             if (relStart < normalizedFullPath.Length && normalizedFullPath[relStart] == '/')
                 relStart++;
 
-            string relativePath = normalizedFullPath.Substring(relStart);
-            if (string.IsNullOrEmpty(relativePath))
+            ReadOnlySpan<char> relativePath = normalizedFullPath.Slice(relStart);
+            if (relativePath.IsEmpty)
                 return null;
 
             bool? result = null;

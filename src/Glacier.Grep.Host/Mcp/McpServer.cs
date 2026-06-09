@@ -20,7 +20,8 @@ namespace Glacier.Grep.Host.Mcp
         private static readonly JsonSerializerOptions JsonOpts = new()
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            TypeInfoResolver = McpJsonContext.Default
         };
 
         public McpServer()
@@ -266,13 +267,13 @@ namespace Glacier.Grep.Host.Mcp
                 if (matches.Count > maxResults)
                 {
                     var truncated = matches.GetRange(0, maxResults);
-                    string truncatedJson = JsonSerializer.Serialize(truncated, JsonOpts);
+                    string truncatedJson = JsonSerializer.Serialize<List<SearchResult>>(truncated, JsonOpts);
                     string summary = $"Showing first {maxResults} out of {matches.Count} matches found.\n\n" + truncatedJson;
                     return CreateToolResponse(summary);
                 }
                 else
                 {
-                    string resultsJson = JsonSerializer.Serialize(matches, JsonOpts);
+                    string resultsJson = JsonSerializer.Serialize<List<SearchResult>>(matches, JsonOpts);
                     return CreateToolResponse(resultsJson);
                 }
             }
@@ -304,7 +305,7 @@ namespace Glacier.Grep.Host.Mcp
                 response["id"] = id;
             }
 
-            string json = JsonSerializer.Serialize(response, JsonOpts);
+            string json = JsonSerializer.Serialize<Dictionary<string, object>>(response, JsonOpts);
             Log($"Sending: {json}");
             await _writer.WriteLineAsync(json);
         }
@@ -322,9 +323,17 @@ namespace Glacier.Grep.Host.Mcp
                 response["id"] = id;
             }
 
-            string json = JsonSerializer.Serialize(response, JsonOpts);
+            string json = JsonSerializer.Serialize<Dictionary<string, object>>(response, JsonOpts);
             Log($"Sending error: {json}");
             await _writer.WriteLineAsync(json);
         }
+    }
+
+    [JsonSerializable(typeof(List<SearchResult>))]
+    [JsonSerializable(typeof(SearchResult))]
+    [JsonSerializable(typeof(Dictionary<string, object>))]
+    [JsonSerializable(typeof(object))]
+    internal partial class McpJsonContext : JsonSerializerContext
+    {
     }
 }

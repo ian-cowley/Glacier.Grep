@@ -36,6 +36,8 @@ namespace Glacier.Grep
             int? maxDepth = null)
         {
             var results = new List<SearchResult>();
+            int totalFilesCount = 0;
+            long totalBytesScanned = 0;
 
             // Setup a bounded channel to queue discovered files
             var channel = Channel.CreateBounded<FileSearchTask>(new BoundedChannelOptions(2048)
@@ -47,12 +49,16 @@ namespace Glacier.Grep
 
             // Start directory enumeration task (Producer)
             var traverser = new DirectoryTraverser(_rootDir, searchHidden, maxDepth);
+            var producerStart = DateTime.UtcNow;
             var producerTask = Task.Run(() =>
             {
                 try
                 {
                     foreach (var fileTask in traverser.EnumerateFiles())
                     {
+                        System.Threading.Interlocked.Increment(ref totalFilesCount);
+                        System.Threading.Interlocked.Add(ref totalBytesScanned, fileTask.Length);
+
                         // Optional filter by file glob patterns
                         if (fileGlobs != null && fileGlobs.Length > 0)
                         {
@@ -69,7 +75,10 @@ namespace Glacier.Grep
                             if (!matchesGlob) continue;
                         }
 
-                        channel.Writer.WriteAsync(fileTask).AsTask().GetAwaiter().GetResult();
+                        if (!channel.Writer.TryWrite(fileTask))
+                        {
+                            channel.Writer.WriteAsync(fileTask).AsTask().GetAwaiter().GetResult();
+                        }
                     }
                 }
                 finally
@@ -92,34 +101,28 @@ namespace Glacier.Grep
                 regex = new Regex(query, options);
             }
 
-            // Create SearchValues pre-filter for the first byte of the pattern
+            // Create SearchValues pre-filter for the first byte of the pattern (only used in case-insensitive literal search)
             SearchValues<byte>? searchBytes = null;
-            if (!isRegex && patternBytes.Length > 0)
+            if (!isRegex && patternBytes.Length > 0 && !caseSensitive)
             {
-                if (caseSensitive)
-                {
-                    searchBytes = SearchValues.Create(new[] { patternBytes[0] });
-                }
-                else
-                {
-                    byte b = patternBytes[0];
-                    byte lower = b;
-                    byte upper = b;
-                    if (b >= 'a' && b <= 'z') upper = (byte)(b - 32);
-                    else if (b >= 'A' && b <= 'Z') lower = (byte)(b + 32);
+                byte b = patternBytes[0];
+                byte lower = b;
+                byte upper = b;
+                if (b >= 'a' && b <= 'z') upper = (byte)(b - 32);
+                else if (b >= 'A' && b <= 'Z') lower = (byte)(b + 32);
 
-                    searchBytes = SearchValues.Create(new[] { lower, upper });
-                }
+                searchBytes = SearchValues.Create(new[] { lower, upper });
             }
 
             // Start search consumers (Workers)
             int workerCount = Environment.ProcessorCount;
-            var workerTasks = new Task[workerCount];
+            var workerTasks = new Task<List<SearchResult>>[workerCount];
 
             for (int i = 0; i < workerCount; i++)
             {
                 workerTasks[i] = Task.Run(async () =>
                 {
+                    var localResults = new List<SearchResult>();
                     var reader = channel.Reader;
                     while (await reader.WaitToReadAsync())
                     {
@@ -127,7 +130,7 @@ namespace Glacier.Grep
                         {
                             try
                             {
-                                SearchFile(task, patternBytes, regex, searchBytes, caseSensitive, contextLines, searchBinary, invertMatch, results);
+                                SearchFile(task, patternBytes, regex, searchBytes, caseSensitive, contextLines, searchBinary, invertMatch, localResults);
                             }
                             catch
                             {
@@ -135,12 +138,18 @@ namespace Glacier.Grep
                             }
                         }
                     }
+                    return localResults;
                 });
             }
 
             // Wait for workers and producer to complete
             await Task.WhenAll(workerTasks);
             await producerTask;
+
+            for (int i = 0; i < workerCount; i++)
+            {
+                results.AddRange(workerTasks[i].Result);
+            }
 
             return results;
         }
@@ -195,65 +204,137 @@ namespace Glacier.Grep
         {
             if (patternBytes.Length == 0) return;
 
-            int offset = 0;
-            while (offset < fileData.Length)
+            int m = patternBytes.Length;
+            int lastNewlineOffset = 0;
+            int currentLineNumber = 1;
+
+            if (caseSensitive || m == 1)
             {
-                // SIMD-accelerated check for the first byte of search term
-                int matchIndex = fileData.Slice(offset).IndexOfAny(searchBytes!);
-                if (matchIndex < 0) break;
-
-                offset += matchIndex;
-
-                // Validate the complete pattern matches
-                bool isMatch;
-                if (caseSensitive)
+                int offset = 0;
+                while (offset < fileData.Length)
                 {
-                    isMatch = fileData.Slice(offset).StartsWith(patternBytes);
-                }
-                else
-                {
-                    isMatch = EqualsIgnoreCaseAscii(fileData.Slice(offset), patternBytes);
-                }
-
-                if (isMatch)
-                {
-                    // Establish line start and line end offsets
-                    int lineStart = fileData.Slice(0, offset).LastIndexOf((byte)'\n') + 1;
-                    int lineEnd = fileData.Slice(offset).IndexOf((byte)'\n');
-                    if (lineEnd < 0) lineEnd = fileData.Length;
-                    else lineEnd += offset;
-
-                    ReadOnlySpan<byte> lineSpan = fileData.Slice(lineStart, lineEnd - lineStart);
-                    if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
-                        lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
-
-                    int lineNumber = CountNewlines(fileData.Slice(0, lineStart)) + 1;
-
-                    // Extract context lines
-                    var contextBefore = GetContextBefore(fileData, lineStart, contextLines);
-                    var contextAfter = GetContextAfter(fileData, lineEnd, contextLines);
-
-                    var result = new SearchResult
+                    int matchIndex;
+                    if (caseSensitive)
                     {
-                        FilePath = task.RelativePath,
-                        LineNumber = lineNumber,
-                        MatchContent = Encoding.UTF8.GetString(lineSpan),
-                        MatchStartIndex = offset - lineStart,
-                        MatchLength = patternBytes.Length,
-                        ContextBefore = contextBefore,
-                        ContextAfter = contextAfter
-                    };
-
-                    lock (results)
+                        matchIndex = fileData.Slice(offset).IndexOf(patternBytes);
+                    }
+                    else
                     {
-                        results.Add(result);
+                        matchIndex = fileData.Slice(offset).IndexOfAny(searchBytes!);
                     }
 
-                    offset += patternBytes.Length;
+                    if (matchIndex < 0) break;
+
+                    offset += matchIndex;
+
+                    bool isMatch = true;
+                    if (!caseSensitive)
+                    {
+                        isMatch = EqualsIgnoreCaseAscii(fileData.Slice(offset), patternBytes);
+                    }
+
+                    if (isMatch)
+                    {
+                        int lineStart = fileData.Slice(0, offset).LastIndexOf((byte)'\n') + 1;
+                        int lineEnd = fileData.Slice(offset).IndexOf((byte)'\n');
+                        if (lineEnd < 0) lineEnd = fileData.Length;
+                        else lineEnd += offset;
+
+                        ReadOnlySpan<byte> lineSpan = fileData.Slice(lineStart, lineEnd - lineStart);
+                        if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
+                            lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
+
+                        currentLineNumber += fileData.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count((byte)'\n');
+                        lastNewlineOffset = lineStart;
+
+                        string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
+
+                        var result = new SearchResult
+                        {
+                            FilePath = relativePath,
+                            LineNumber = currentLineNumber,
+                            MatchContent = Encoding.UTF8.GetString(lineSpan),
+                            MatchStartIndex = offset - lineStart,
+                            MatchLength = m
+                        };
+
+                        if (contextLines > 0)
+                        {
+                            result.ContextBefore = GetContextBefore(fileData, lineStart, contextLines);
+                            result.ContextAfter = GetContextAfter(fileData, lineEnd, contextLines);
+                        }
+
+                        results.Add(result);
+
+                        offset += m;
+                    }
+                    else
+                    {
+                        offset += 1;
+                    }
                 }
-                else
+            }
+            else
+            {
+                // Case-insensitive Boyer-Moore-Horspool algorithm
+                Span<int> shift = stackalloc int[256];
+                for (int i = 0; i < 256; i++)
                 {
-                    offset += 1;
+                    shift[i] = m;
+                }
+                for (int i = 0; i < m - 1; i++)
+                {
+                    byte b = patternBytes[i];
+                    int s = m - 1 - i;
+                    shift[b] = s;
+                    if (b >= 'a' && b <= 'z') shift[b - 32] = s;
+                    else if (b >= 'A' && b <= 'Z') shift[b + 32] = s;
+                }
+
+                int offset = 0;
+                int limit = fileData.Length - m;
+                while (offset <= limit)
+                {
+                    if (EqualsIgnoreCaseAscii(fileData.Slice(offset, m), patternBytes))
+                    {
+                        int lineStart = fileData.Slice(0, offset).LastIndexOf((byte)'\n') + 1;
+                        int lineEnd = fileData.Slice(offset).IndexOf((byte)'\n');
+                        if (lineEnd < 0) lineEnd = fileData.Length;
+                        else lineEnd += offset;
+
+                        ReadOnlySpan<byte> lineSpan = fileData.Slice(lineStart, lineEnd - lineStart);
+                        if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
+                            lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
+
+                        currentLineNumber += fileData.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count((byte)'\n');
+                        lastNewlineOffset = lineStart;
+
+                        string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
+
+                        var result = new SearchResult
+                        {
+                            FilePath = relativePath,
+                            LineNumber = currentLineNumber,
+                            MatchContent = Encoding.UTF8.GetString(lineSpan),
+                            MatchStartIndex = offset - lineStart,
+                            MatchLength = m
+                        };
+
+                        if (contextLines > 0)
+                        {
+                            result.ContextBefore = GetContextBefore(fileData, lineStart, contextLines);
+                            result.ContextAfter = GetContextAfter(fileData, lineEnd, contextLines);
+                        }
+
+                        results.Add(result);
+
+                        offset += m;
+                    }
+                    else
+                    {
+                        byte lastByte = fileData[offset + m - 1];
+                        offset += shift[lastByte];
+                    }
                 }
             }
         }
@@ -265,82 +346,58 @@ namespace Glacier.Grep
             int contextLines,
             List<SearchResult> results)
         {
-            int offset = 0;
-            int lineNumber = 1;
-            int maxLineLength = 16384;
-            char[] charBuffer = ArrayPool<char>.Shared.Rent(maxLineLength);
+            // Rent a char buffer to decode the whole file at once (drastically reduces overhead of line-by-line decoding)
+            int maxCharCount = Encoding.UTF8.GetMaxCharCount(fileData.Length);
+            char[] charBuffer = ArrayPool<char>.Shared.Rent(maxCharCount);
 
             try
             {
-                while (offset < fileData.Length)
-                {
-                    int lineEnd = fileData.Slice(offset).IndexOf((byte)'\n');
-                    int nextOffset;
-                    int currentLineEnd;
-                    if (lineEnd < 0)
-                    {
-                        currentLineEnd = fileData.Length;
-                        nextOffset = fileData.Length;
-                    }
-                    else
-                    {
-                        currentLineEnd = offset + lineEnd;
-                        nextOffset = currentLineEnd + 1;
-                    }
+                int charCount = Encoding.UTF8.GetChars(fileData, charBuffer);
+                ReadOnlySpan<char> fileChars = charBuffer.AsSpan(0, charCount);
 
-                    ReadOnlySpan<byte> lineSpan = fileData.Slice(offset, currentLineEnd - offset);
+                var enumerator = regex.EnumerateMatches(fileChars);
+                int lastNewlineOffset = 0;
+                int currentLineNumber = 1;
+
+                while (enumerator.MoveNext())
+                {
+                    var match = enumerator.Current;
+                    int matchStart = match.Index;
+                    int matchLength = match.Length;
+
+                    // Find line boundaries in char space
+                    int lineStart = fileChars.Slice(0, matchStart).LastIndexOf('\n') + 1;
+                    int lineEnd = fileChars.Slice(matchStart).IndexOf('\n');
+                    if (lineEnd < 0) lineEnd = fileChars.Length;
+                    else lineEnd += matchStart;
+
+                    ReadOnlySpan<char> lineSpan = fileChars.Slice(lineStart, lineEnd - lineStart);
                     if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
                         lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
 
-                    int requiredChars = Encoding.UTF8.GetMaxCharCount(lineSpan.Length);
-                    if (requiredChars > charBuffer.Length)
+                    // Incremental line number counting
+                    currentLineNumber += fileChars.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count('\n');
+                    lastNewlineOffset = lineStart;
+
+                    // Lazy relative path calculation
+                    string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
+
+                    var result = new SearchResult
                     {
-                        ArrayPool<char>.Shared.Return(charBuffer);
-                        charBuffer = ArrayPool<char>.Shared.Rent(requiredChars);
+                        FilePath = relativePath,
+                        LineNumber = currentLineNumber,
+                        MatchContent = new string(lineSpan),
+                        MatchStartIndex = matchStart - lineStart,
+                        MatchLength = matchLength
+                    };
+
+                    if (contextLines > 0)
+                    {
+                        result.ContextBefore = GetContextBeforeChars(fileChars, lineStart, contextLines);
+                        result.ContextAfter = GetContextAfterChars(fileChars, lineEnd, contextLines);
                     }
 
-                    int charCount = Encoding.UTF8.GetChars(lineSpan, charBuffer);
-                    ReadOnlySpan<char> charSpan = charBuffer.AsSpan(0, charCount);
-
-                    var enumerator = regex.EnumerateMatches(charSpan);
-                    bool lineHasMatch = false;
-                    int firstMatchIndex = 0;
-                    int firstMatchLength = 0;
-
-                    while (enumerator.MoveNext())
-                    {
-                        if (!lineHasMatch)
-                        {
-                            lineHasMatch = true;
-                            firstMatchIndex = enumerator.Current.Index;
-                            firstMatchLength = enumerator.Current.Length;
-                        }
-                    }
-
-                    if (lineHasMatch)
-                    {
-                        var contextBefore = GetContextBefore(fileData, offset, contextLines);
-                        var contextAfter = GetContextAfter(fileData, currentLineEnd, contextLines);
-
-                        var result = new SearchResult
-                        {
-                            FilePath = task.RelativePath,
-                            LineNumber = lineNumber,
-                            MatchContent = new string(charSpan),
-                            MatchStartIndex = firstMatchIndex,
-                            MatchLength = firstMatchLength,
-                            ContextBefore = contextBefore,
-                            ContextAfter = contextAfter
-                        };
-
-                        lock (results)
-                        {
-                            results.Add(result);
-                        }
-                    }
-
-                    lineNumber++;
-                    offset = nextOffset;
+                    results.Add(result);
                 }
             }
             finally
@@ -415,24 +472,25 @@ namespace Glacier.Grep
 
                     if (!hasMatch)
                     {
-                        var contextBefore = GetContextBefore(fileData, offset, contextLines);
-                        var contextAfter = GetContextAfter(fileData, currentLineEnd, contextLines);
+                        // Lazy relative path calculation
+                        string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
 
                         var result = new SearchResult
                         {
-                            FilePath = task.RelativePath,
+                            FilePath = relativePath,
                             LineNumber = lineNumber,
                             MatchContent = Encoding.UTF8.GetString(lineSpan),
                             MatchStartIndex = 0,
-                            MatchLength = lineSpan.Length,
-                            ContextBefore = contextBefore,
-                            ContextAfter = contextAfter
+                            MatchLength = lineSpan.Length
                         };
 
-                        lock (results)
+                        if (contextLines > 0)
                         {
-                            results.Add(result);
+                            result.ContextBefore = GetContextBefore(fileData, offset, contextLines);
+                            result.ContextAfter = GetContextAfter(fileData, currentLineEnd, contextLines);
                         }
+
+                        results.Add(result);
                     }
 
                     lineNumber++;
@@ -454,9 +512,10 @@ namespace Glacier.Grep
                 byte b2 = pattern[i];
                 if (b1 != b2)
                 {
-                    if (b1 >= 'A' && b1 <= 'Z') b1 = (byte)(b1 + 32);
-                    if (b2 >= 'A' && b2 <= 'Z') b2 = (byte)(b2 + 32);
-                    if (b1 != b2) return false;
+                    int lower1 = b1 | 0x20;
+                    int lower2 = b2 | 0x20;
+                    if (lower1 != lower2 || (uint)(lower1 - 'a') > (uint)('z' - 'a'))
+                        return false;
                 }
             }
             return true;
@@ -476,18 +535,6 @@ namespace Glacier.Grep
                 }
             }
             return -1;
-        }
-
-        private static int CountNewlines(ReadOnlySpan<byte> span)
-        {
-            int count = 0;
-            int index;
-            while ((index = span.IndexOf((byte)'\n')) >= 0)
-            {
-                count++;
-                span = span.Slice(index + 1);
-            }
-            return count;
         }
 
         private static List<string> GetContextBefore(ReadOnlySpan<byte> fileData, int lineStartOffset, int contextCount)
@@ -536,6 +583,62 @@ namespace Glacier.Grep
                     if (lineBytes.Length > 0 && lineBytes[^1] == '\r')
                         lineBytes = lineBytes.Slice(0, lineBytes.Length - 1);
                     contextLines.Add(Encoding.UTF8.GetString(lineBytes));
+                }
+                else
+                {
+                    contextLines.Add(string.Empty);
+                }
+                currentOffset = end + 1;
+            }
+            return contextLines;
+        }
+
+        private static List<string> GetContextBeforeChars(ReadOnlySpan<char> fileChars, int lineStartOffset, int contextCount)
+        {
+            var contextLines = new List<string>();
+            if (contextCount <= 0 || lineStartOffset <= 0) return contextLines;
+
+            int currentOffset = lineStartOffset - 1;
+            for (int i = 0; i < contextCount; i++)
+            {
+                if (currentOffset < 0) break;
+                int prevNewline = fileChars.Slice(0, currentOffset).LastIndexOf('\n');
+                int start = prevNewline < 0 ? 0 : prevNewline + 1;
+                int length = currentOffset - start;
+                if (length > 0)
+                {
+                    var lineSpan = fileChars.Slice(start, length);
+                    if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
+                        lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
+                    contextLines.Insert(0, new string(lineSpan));
+                }
+                else
+                {
+                    contextLines.Insert(0, string.Empty);
+                }
+                currentOffset = prevNewline;
+            }
+            return contextLines;
+        }
+
+        private static List<string> GetContextAfterChars(ReadOnlySpan<char> fileChars, int lineEndOffset, int contextCount)
+        {
+            var contextLines = new List<string>();
+            if (contextCount <= 0 || lineEndOffset >= fileChars.Length) return contextLines;
+
+            int currentOffset = lineEndOffset + 1;
+            for (int i = 0; i < contextCount; i++)
+            {
+                if (currentOffset >= fileChars.Length) break;
+                int nextNewline = fileChars.Slice(currentOffset).IndexOf('\n');
+                int end = nextNewline < 0 ? fileChars.Length : currentOffset + nextNewline;
+                int length = end - currentOffset;
+                if (length > 0)
+                {
+                    var lineSpan = fileChars.Slice(currentOffset, length);
+                    if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
+                        lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
+                    contextLines.Add(new string(lineSpan));
                 }
                 else
                 {

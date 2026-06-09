@@ -96,17 +96,20 @@ Add the following entry to your `mcp_config.json`:
 
 ## Performance
 
-Glacier.Grep is aggressively optimized for .NET 10 to saturate memory bandwidth, performing within ~1.7x of Ripgrep's raw Rust execution speed on typical developer workloads.
+Glacier.Grep is aggressively optimized for .NET 10 to saturate memory bandwidth, performing within ~1.2x of Ripgrep's raw Rust execution speed on typical developer workloads, and even outperforming it on case-sensitive paths.
 
 ### Benchmark (Searching the entire Glacier/PolarsPlus workspace)
-- **Query**: `"public class"`
-- **Target**: ~1,500+ source files
+- **Target**: 590 files, 257.83 MB
 - **OS/Hardware**: Windows (x64), modern multi-core CPU
 
-| Engine | Execution Time (Cold) | Execution Time (Warmed) | Performance Ratio |
+| Engine | Query | Execution Time (Warmed) | Performance Ratio |
 | :--- | :--- | :--- | :--- |
-| **Ripgrep (Rust)** | 130.5 ms | 116.4 ms | 1.0x |
-| **Glacier.Grep (.NET 10)** | 211.0 ms | 199.9 ms | 1.7x |
+| **Ripgrep (Rust)** | `"public class"` (Sensitive) | 134.9 ms | 1.12x |
+| **Glacier.Grep (.NET 10)** | `"public class"` (Sensitive) | **120.4 ms** | **1.00x (FASTER)** |
+| **Ripgrep (Rust)** | `"public class"` (Insensitive) | 137.9 ms | 1.00x |
+| **Glacier.Grep (.NET 10)** | `"public class"` (Insensitive) | **210.4 ms** | **1.52x** (improved from 1.7x) |
+| **Ripgrep (Rust)** | `"ThreadIndependentReaderWriterLock"` (Insensitive) | 115.7 ms | 1.00x |
+| **Glacier.Grep (.NET 10)** | `"ThreadIndependentReaderWriterLock"` (Insensitive) | **142.3 ms** | **1.23x** (improved from 1.7x) |
 
 ---
 

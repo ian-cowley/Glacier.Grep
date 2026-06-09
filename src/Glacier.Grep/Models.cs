@@ -28,13 +28,11 @@ namespace Glacier.Grep
     public readonly struct FileSearchTask
     {
         public string FullPath { get; }
-        public string RelativePath { get; }
         public long Length { get; }
 
-        public FileSearchTask(string fullPath, string relativePath, long length)
+        public FileSearchTask(string fullPath, long length)
         {
             FullPath = fullPath;
-            RelativePath = relativePath;
             Length = length;
         }
     }
@@ -50,7 +48,7 @@ namespace Glacier.Grep
         public string MatchContent { get; set; } = string.Empty;
         public int MatchStartIndex { get; set; }
         public int MatchLength { get; set; }
-        public List<string> ContextBefore { get; set; } = new();
-        public List<string> ContextAfter { get; set; } = new();
+        public IReadOnlyList<string> ContextBefore { get; set; } = Array.Empty<string>();
+        public IReadOnlyList<string> ContextAfter { get; set; } = Array.Empty<string>();
     }
 }
