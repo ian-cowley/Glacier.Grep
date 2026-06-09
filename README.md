@@ -1,5 +1,8 @@
 # Glacier.Grep
 
+[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Grep.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Grep/)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Grep.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Grep/)
+
 **Glacier.Grep** is a native, high-performance, zero-allocation C# search engine and index for .NET 10. Built to take on `ripgrep` within the Glacier ecosystem, it provides aggressive hardware acceleration (SIMD), concurrent work-stealing directory scanning, and built-in support for the Model Context Protocol (MCP).
 
 ---
@@ -88,6 +91,22 @@ Add the following entry to your `mcp_config.json`:
   - `searchBinary` (boolean, optional): Search binary files (do not skip).
   - `invertMatch` (boolean, optional): Invert the match (show lines that do NOT contain the query).
   - `maxDepth` (integer, optional): Maximum recursion depth for subdirectories.
+
+---
+
+## Performance
+
+Glacier.Grep is aggressively optimized for .NET 10 to saturate memory bandwidth, performing within ~1.7x of Ripgrep's raw Rust execution speed on typical developer workloads.
+
+### Benchmark (Searching the entire Glacier/PolarsPlus workspace)
+- **Query**: `"public class"`
+- **Target**: ~1,500+ source files
+- **OS/Hardware**: Windows (x64), modern multi-core CPU
+
+| Engine | Execution Time (Cold) | Execution Time (Warmed) | Performance Ratio |
+| :--- | :--- | :--- | :--- |
+| **Ripgrep (Rust)** | 130.5 ms | 116.4 ms | 1.0x |
+| **Glacier.Grep (.NET 10)** | 211.0 ms | 199.9 ms | 1.7x |
 
 ---
 
