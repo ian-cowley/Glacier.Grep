@@ -2,6 +2,7 @@
 [Bb]in/
 [Oo]bj/
 [Rr]elease/
+publish/
 
 # IDE and editor folders
 .vs/
