@@ -1,3 +1,5 @@
+![Glacier.Grep Banner](assets/banner.jpg)
+
 # Glacier.Grep
 
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Grep.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Grep/)
