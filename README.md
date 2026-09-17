@@ -98,20 +98,17 @@ Add the following entry to your `mcp_config.json`:
 
 ## Performance
 
-Glacier.Grep is aggressively optimized for .NET 10 to saturate memory bandwidth, performing within ~1.2x of Ripgrep's raw Rust execution speed on typical developer workloads, and even outperforming it on case-sensitive paths.
+Glacier.Grep is engineered in pure C# .NET 10 to saturate CPU memory bandwidth. On exact case-sensitive code symbol searches, Glacier.Grep **outperforms Rust's Ripgrep by 12%**, while maintaining near-parity (within 1.2x–1.5x) on complex case-insensitive searches with zero native DLL dependencies.
 
-### Benchmark (Searching the entire Glacier/PolarsPlus workspace)
-- **Target**: 590 files, 257.83 MB
-- **OS/Hardware**: Windows (x64), modern multi-core CPU
+### Benchmark: Full Glacier / PolarsPlus Repository Search
+- **Target Corpus**: 590 files, 257.83 MB
+- **Platform**: Windows x64, AMD Ryzen AI 9 HX 370
 
-| Engine | Query | Execution Time (Warmed) | Performance Ratio |
-| :--- | :--- | :--- | :--- |
-| **Ripgrep (Rust)** | `"public class"` (Sensitive) | 134.9 ms | 1.12x |
-| **Glacier.Grep (.NET 10)** | `"public class"` (Sensitive) | **120.4 ms** | **1.00x (FASTER)** |
-| **Ripgrep (Rust)** | `"public class"` (Insensitive) | 137.9 ms | 1.00x |
-| **Glacier.Grep (.NET 10)** | `"public class"` (Insensitive) | **210.4 ms** | **1.52x** (improved from 1.7x) |
-| **Ripgrep (Rust)** | `"ThreadIndependentReaderWriterLock"` (Insensitive) | 115.7 ms | 1.00x |
-| **Glacier.Grep (.NET 10)** | `"ThreadIndependentReaderWriterLock"` (Insensitive) | **142.3 ms** | **1.23x** (improved from 1.7x) |
+| Search Query | Match Mode | Ripgrep (Rust) | Glacier.Grep (.NET 10) | Result |
+| :--- | :--- | :---: | :---: | :--- |
+| `"public class"` | Case-Sensitive | 134.9 ms | **120.4 ms** | 🚀 **Glacier is 12% FASTER** |
+| `"ThreadIndependentReaderWriterLock"` | Case-Insensitive | **115.7 ms** | 142.3 ms | ⚡ **Near-Parity** (within 1.23x of Rust) |
+| `"public class"` | Case-Insensitive | **137.9 ms** | 210.4 ms | 🔹 Ripgrep leads (within 1.52x of Rust) |
 
 ### Memory-Mapped File Pooling (PB-21 Optimization)
 To eliminate Windows OS section object and view creation overhead on medium-sized files (1MB to 8MB), `Glacier.Grep` utilizes an 8MB anonymous `MemoryMappedFile` handle pool (`s_mediumMmfPool`):
