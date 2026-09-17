@@ -231,5 +231,64 @@ namespace Glacier.Grep.Tests
             Assert.Single(resultsBinary);
             Assert.Equal("app.bin", Path.GetFileName(resultsBinary[0].FilePath));
         }
+
+        [Fact]
+        public void Test_HybridIoDispatcher_MediumFilePooled_ReadsDataCorrectly()
+        {
+            // 2 MB file (in the 1-8 MB medium range)
+            int mediumFileSize = 2 * 1024 * 1024;
+            string mediumFile = Path.Combine(_tempDir, "medium_test.dat");
+            byte[] dummyData = new byte[mediumFileSize];
+            Array.Fill(dummyData, (byte)'A');
+            dummyData[100] = (byte)'X';
+            dummyData[mediumFileSize - 10] = (byte)'Z';
+            File.WriteAllBytes(mediumFile, dummyData);
+
+            long length = new FileInfo(mediumFile).Length;
+            Assert.Equal(mediumFileSize, length);
+
+            bool processed = false;
+            // Process file twice to verify handle pooling / reuse
+            for (int run = 0; run < 2; run++)
+            {
+                HybridIoDispatcher.ProcessFile(mediumFile, length, (ReadOnlySpan<byte> span) =>
+                {
+                    Assert.Equal(mediumFileSize, span.Length);
+                    Assert.Equal((byte)'X', span[100]);
+                    Assert.Equal((byte)'Z', span[mediumFileSize - 10]);
+                    processed = true;
+                });
+                Assert.True(processed);
+            }
+        }
+
+        [Fact]
+        public async Task Test_SearchEngine_MediumFileSearch_FindsTarget()
+        {
+            // Create a 2 MB text file with 30,000 lines
+            string mediumTextFile = Path.Combine(_tempDir, "medium_source.txt");
+            using (var writer = new StreamWriter(mediumTextFile))
+            {
+                for (int i = 1; i <= 30000; i++)
+                {
+                    if (i == 15432)
+                    {
+                        writer.WriteLine("Line 15432: TargetKeywordFoundHere in medium file!");
+                    }
+                    else
+                    {
+                        writer.WriteLine($"Line {i}: Normal dummy text content for medium file search testing.");
+                    }
+                }
+            }
+
+            var engine = new SearchEngine(_tempDir);
+            var results = await engine.SearchAsync("TargetKeywordFoundHere", isRegex: false, caseSensitive: true, contextLines: 0, fileGlobs: null);
+
+            Assert.Single(results);
+            Assert.Equal(15432, results[0].LineNumber);
+            Assert.Contains("TargetKeywordFoundHere", results[0].MatchContent);
+            Assert.Equal("medium_source.txt", Path.GetFileName(results[0].FilePath));
+        }
     }
 }

@@ -1,7 +1,9 @@
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace Glacier.Grep
@@ -14,10 +16,76 @@ namespace Glacier.Grep
     /// <summary>
     /// Hybrid I/O Dispatcher that routes I/O patterns based on file size
     /// to bypass stream buffer overhead and utilize zero-copy memory mapping or pooled array blocks.
+    /// Pools MemoryMappedFile handles on medium files (1-8 MB) to eliminate OS section and view churn.
     /// </summary>
     public static class HybridIoDispatcher
     {
-        private const long OneMegaByte = 1024 * 1024;
+        public const long OneMegaByte = 1024 * 1024;
+        public const long EightMegaBytes = 8 * 1024 * 1024;
+
+        private static readonly ConcurrentQueue<PooledMmfHandle> s_mediumMmfPool = new();
+        private static int s_pooledCount = 0;
+        private static readonly int s_maxPooledHandles = Math.Max(4, Environment.ProcessorCount * 2);
+
+        /// <summary>
+        /// Represents a pooled 8MB anonymous MemoryMappedFile handle and view accessor,
+        /// eliminating OS file mapping handle churn (CreateFileMapping / MapViewOfFile / UnmapViewOfFile)
+        /// for medium files (1-8 MB).
+        /// </summary>
+        private sealed unsafe class PooledMmfHandle : IDisposable
+        {
+            public readonly MemoryMappedFile Mmf;
+            public readonly MemoryMappedViewAccessor Accessor;
+            public readonly byte* Pointer;
+
+            public PooledMmfHandle(long capacity = EightMegaBytes)
+            {
+                Mmf = MemoryMappedFile.CreateNew(null, capacity, MemoryMappedFileAccess.ReadWrite);
+                Accessor = Mmf.CreateViewAccessor(0, capacity, MemoryMappedFileAccess.ReadWrite);
+                byte* ptr = null;
+                Accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+                Pointer = ptr + Accessor.PointerOffset;
+            }
+
+            public void Dispose()
+            {
+                try { Accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                try { Accessor.Dispose(); } catch { }
+                try { Mmf.Dispose(); } catch { }
+            }
+        }
+
+        private static PooledMmfHandle RentMediumHandle()
+        {
+            if (s_mediumMmfPool.TryDequeue(out var handle))
+            {
+                Interlocked.Decrement(ref s_pooledCount);
+                return handle;
+            }
+            return new PooledMmfHandle(EightMegaBytes);
+        }
+
+        private static void ReturnMediumHandle(PooledMmfHandle handle)
+        {
+            if (Interlocked.Increment(ref s_pooledCount) <= s_maxPooledHandles)
+            {
+                s_mediumMmfPool.Enqueue(handle);
+            }
+            else
+            {
+                Interlocked.Decrement(ref s_pooledCount);
+                handle.Dispose();
+            }
+        }
+
+        public static void ClearPool()
+        {
+            while (s_mediumMmfPool.TryDequeue(out var handle))
+            {
+                handle.Dispose();
+            }
+            s_pooledCount = 0;
+        }
 
         public static void ProcessFile(string path, long length, FileDataProcessor processor)
         {
@@ -31,9 +99,41 @@ namespace Glacier.Grep
             {
                 ProcessRentedArray(path, (int)length, processor);
             }
+            else if (length <= EightMegaBytes)
+            {
+                ProcessMediumFilePooled(path, (int)length, processor);
+            }
             else
             {
                 ProcessMemoryMapped(path, length, processor);
+            }
+        }
+
+        private static unsafe void ProcessMediumFilePooled(string path, int length, FileDataProcessor processor)
+        {
+            var pooledHandle = RentMediumHandle();
+            try
+            {
+                using SafeFileHandle fileHandle = File.OpenHandle(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    FileOptions.SequentialScan);
+
+                int totalRead = 0;
+                while (totalRead < length)
+                {
+                    int read = RandomAccess.Read(fileHandle, new Span<byte>(pooledHandle.Pointer + totalRead, length - totalRead), totalRead);
+                    if (read == 0) break;
+                    totalRead += read;
+                }
+
+                processor(new ReadOnlySpan<byte>(pooledHandle.Pointer, totalRead));
+            }
+            finally
+            {
+                ReturnMediumHandle(pooledHandle);
             }
         }
 
