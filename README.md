@@ -2,8 +2,12 @@
 
 # Glacier.Grep
 
-[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Grep.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Grep/)
-[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Grep.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Grep/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
+[![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
+[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Grep.svg)](https://www.nuget.org/packages/Glacier.Grep/)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Grep.svg)](https://www.nuget.org/packages/Glacier.Grep/)
+[![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
 
 **Glacier.Grep** is a native, high-performance, zero-allocation C# search engine and index for .NET 10. Built to take on `ripgrep` within the Glacier ecosystem, it provides aggressive hardware acceleration (SIMD), concurrent work-stealing directory scanning, and built-in support for the Model Context Protocol (MCP).
 
