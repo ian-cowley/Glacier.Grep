@@ -267,13 +267,13 @@ namespace Glacier.Grep.Host.Mcp
                 if (matches.Count > maxResults)
                 {
                     var truncated = matches.GetRange(0, maxResults);
-                    string truncatedJson = JsonSerializer.Serialize<List<SearchResult>>(truncated, JsonOpts);
+                    string truncatedJson = JsonSerializer.Serialize(truncated, McpJsonContext.Default.ListSearchResult);
                     string summary = $"Showing first {maxResults} out of {matches.Count} matches found.\n\n" + truncatedJson;
                     return CreateToolResponse(summary);
                 }
                 else
                 {
-                    string resultsJson = JsonSerializer.Serialize<List<SearchResult>>(matches, JsonOpts);
+                    string resultsJson = JsonSerializer.Serialize(matches, McpJsonContext.Default.ListSearchResult);
                     return CreateToolResponse(resultsJson);
                 }
             }
@@ -281,13 +281,13 @@ namespace Glacier.Grep.Host.Mcp
             throw new ArgumentException($"Tool '{toolName}' is not supported.");
         }
 
-        private static object CreateToolResponse(string text)
+        private static McpToolResponse CreateToolResponse(string text)
         {
-            return new
+            return new McpToolResponse
             {
-                content = new[]
+                Content = new[]
                 {
-                    new { type = "text", text = text }
+                    new McpTextContent { Type = "text", Text = text }
                 }
             };
         }
@@ -305,7 +305,7 @@ namespace Glacier.Grep.Host.Mcp
                 response["id"] = id;
             }
 
-            string json = JsonSerializer.Serialize<Dictionary<string, object>>(response, JsonOpts);
+            string json = JsonSerializer.Serialize(response, McpJsonContext.Default.DictionaryStringObject);
             Log($"Sending: {json}");
             await _writer.WriteLineAsync(json);
         }
@@ -315,7 +315,7 @@ namespace Glacier.Grep.Host.Mcp
             var response = new Dictionary<string, object>
             {
                 ["jsonrpc"] = "2.0",
-                ["error"] = new { code, message }
+                ["error"] = new McpErrorDetail { Code = code, Message = message }
             };
 
             if (id.ValueKind != JsonValueKind.Undefined)
@@ -323,16 +323,36 @@ namespace Glacier.Grep.Host.Mcp
                 response["id"] = id;
             }
 
-            string json = JsonSerializer.Serialize<Dictionary<string, object>>(response, JsonOpts);
+            string json = JsonSerializer.Serialize(response, McpJsonContext.Default.DictionaryStringObject);
             Log($"Sending error: {json}");
             await _writer.WriteLineAsync(json);
         }
+    }
+
+    public sealed class McpTextContent
+    {
+        [JsonPropertyName("type")] public string Type { get; set; } = "text";
+        [JsonPropertyName("text")] public string Text { get; set; } = string.Empty;
+    }
+
+    public sealed class McpToolResponse
+    {
+        [JsonPropertyName("content")] public McpTextContent[] Content { get; set; } = [];
+    }
+
+    public sealed class McpErrorDetail
+    {
+        [JsonPropertyName("code")] public int Code { get; set; }
+        [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
     }
 
     [JsonSerializable(typeof(List<SearchResult>))]
     [JsonSerializable(typeof(SearchResult))]
     [JsonSerializable(typeof(Dictionary<string, object>))]
     [JsonSerializable(typeof(object))]
+    [JsonSerializable(typeof(McpToolResponse))]
+    [JsonSerializable(typeof(McpTextContent))]
+    [JsonSerializable(typeof(McpErrorDetail))]
     internal partial class McpJsonContext : JsonSerializerContext
     {
     }

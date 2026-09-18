@@ -14,6 +14,17 @@ namespace Glacier.Grep
     public delegate void FileDataProcessor(ReadOnlySpan<byte> data);
 
     /// <summary>
+    /// Delegate for processing a memory chunk of file data with physical and logical offset boundaries.
+    /// </summary>
+    public delegate void FileChunkProcessor(
+        ReadOnlySpan<byte> chunkData,
+        long chunkStartOffset,
+        long logicalStartOffset,
+        long logicalEndOffset,
+        long totalLength,
+        bool isLastChunk);
+
+    /// <summary>
     /// Hybrid I/O Dispatcher that routes I/O patterns based on file size
     /// to bypass stream buffer overhead and utilize zero-copy memory mapping or pooled array blocks.
     /// Pools MemoryMappedFile handles on medium files (1-8 MB) to eliminate OS section and view churn.
@@ -22,6 +33,12 @@ namespace Glacier.Grep
     {
         public const long OneMegaByte = 1024 * 1024;
         public const long EightMegaBytes = 8 * 1024 * 1024;
+
+        /// <summary>
+        /// Maximum chunk size for memory mapped file processing. Defaults to 1 GB.
+        /// Configurable for testing boundary conditions with small chunks.
+        /// </summary>
+        public static int MaxChunkSize { get; set; } = 1024 * 1024 * 1024;
 
         private static readonly ConcurrentQueue<PooledMmfHandle> s_mediumMmfPool = new();
         private static int s_pooledCount = 0;
@@ -89,23 +106,36 @@ namespace Glacier.Grep
 
         public static void ProcessFile(string path, long length, FileDataProcessor processor)
         {
+            ProcessFile(path, length, 0, (chunk, start, lStart, lEnd, total, isLast) => processor(chunk));
+        }
+
+        public static void ProcessFile(string path, long length, int overlapMargin, FileChunkProcessor processor)
+        {
             if (length <= 0)
             {
-                processor(ReadOnlySpan<byte>.Empty);
+                processor(ReadOnlySpan<byte>.Empty, 0, 0, 0, 0, true);
                 return;
             }
 
-            if (length < OneMegaByte)
+            int maxChunk = MaxChunkSize;
+            if (length <= maxChunk)
             {
-                ProcessRentedArray(path, (int)length, processor);
-            }
-            else if (length <= EightMegaBytes)
-            {
-                ProcessMediumFilePooled(path, (int)length, processor);
+                if (length < OneMegaByte)
+                {
+                    ProcessRentedArray(path, (int)length, span => processor(span, 0, 0, length, length, true));
+                }
+                else if (length <= EightMegaBytes)
+                {
+                    ProcessMediumFilePooled(path, (int)length, span => processor(span, 0, 0, length, length, true));
+                }
+                else
+                {
+                    ProcessMemoryMapped(path, length, overlapMargin, processor);
+                }
             }
             else
             {
-                ProcessMemoryMapped(path, length, processor);
+                ProcessMemoryMapped(path, length, overlapMargin, processor);
             }
         }
 
@@ -159,7 +189,7 @@ namespace Glacier.Grep
             }
         }
 
-        private static void ProcessMemoryMapped(string path, long length, FileDataProcessor processor)
+        private static void ProcessMemoryMapped(string path, long length, int overlapMargin, FileChunkProcessor processor)
         {
             using var mmf = MemoryMappedFile.CreateFromFile(
                 path, 
@@ -179,25 +209,34 @@ namespace Glacier.Grep
                     byte* start = pointer + accessor.PointerOffset;
                     long capacity = accessor.Capacity;
 
-                    // ReadOnlySpan length is limited to int.MaxValue (2GB).
-                    // If the capacity exceeds this, we process the file in 1GB blocks.
-                    if (capacity <= int.MaxValue)
+                    int maxChunk = MaxChunkSize;
+                    if (capacity <= maxChunk)
                     {
                         var fileData = new ReadOnlySpan<byte>(start, (int)capacity);
-                        processor(fileData);
+                        processor(fileData, 0, 0, capacity, capacity, true);
                     }
                     else
                     {
-                        const int maxSpanChunk = 1024 * 1024 * 1024; // 1 GB chunks
-                        long remaining = capacity;
-                        long offset = 0;
-                        while (remaining > 0)
+                        int overlap = Math.Max(0, overlapMargin);
+                        if (overlap > maxChunk / 2)
                         {
-                            int currentChunkSize = (int)Math.Min(remaining, maxSpanChunk);
-                            var fileData = new ReadOnlySpan<byte>(start + offset, currentChunkSize);
-                            processor(fileData);
-                            offset += currentChunkSize;
-                            remaining -= currentChunkSize;
+                            overlap = maxChunk / 2;
+                        }
+
+                        long logicalOffset = 0;
+                        while (logicalOffset < capacity)
+                        {
+                            long logicalEnd = Math.Min(logicalOffset + maxChunk, capacity);
+                            long chunkStart = (logicalOffset == 0) ? 0 : logicalOffset - overlap;
+                            long chunkEnd = logicalEnd;
+                            int chunkSize = (int)(chunkEnd - chunkStart);
+
+                            bool isLast = (logicalEnd >= capacity);
+                            var fileData = new ReadOnlySpan<byte>(start + chunkStart, chunkSize);
+
+                            processor(fileData, chunkStart, logicalOffset, logicalEnd, capacity, isLast);
+
+                            logicalOffset = logicalEnd;
                         }
                     }
                 }

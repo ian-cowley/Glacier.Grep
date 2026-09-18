@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using Glacier.Grep;
 using Xunit;
@@ -289,6 +290,94 @@ namespace Glacier.Grep.Tests
             Assert.Equal(15432, results[0].LineNumber);
             Assert.Contains("TargetKeywordFoundHere", results[0].MatchContent);
             Assert.Equal("medium_source.txt", Path.GetFileName(results[0].FilePath));
+        }
+
+        [Fact]
+        public async Task Test_SearchEngine_ChunkBoundarySpan_FindsPatternCrossingBoundary()
+        {
+            int originalMaxChunk = HybridIoDispatcher.MaxChunkSize;
+            try
+            {
+                // Set chunk size to 256 bytes to force chunking on small files
+                HybridIoDispatcher.MaxChunkSize = 256;
+
+                string filePath = Path.Combine(_tempDir, "boundary_crossing.txt");
+
+                // Line 1: 250 bytes
+                // Line 2 starts at 251: 4 'B's + TARGET (starts at 255, crossing 256 boundary into chunk 1)
+                using (var stream = File.Create(filePath))
+                using (var writer = new StreamWriter(stream, Encoding.UTF8))
+                {
+                    writer.Write(new string('A', 249) + "\n");
+                    writer.Write("BBBB" + "CROSS_BOUNDARY_TARGET" + "BBBB\n");
+                    writer.Write(new string('C', 200) + "\n");
+                }
+
+                var engine = new SearchEngine(_tempDir);
+                var results = await engine.SearchAsync("CROSS_BOUNDARY_TARGET", isRegex: false, caseSensitive: true, contextLines: 0, fileGlobs: new[] { "boundary_crossing.txt" });
+
+                Assert.Single(results);
+                Assert.Equal(2, results[0].LineNumber);
+                Assert.Contains("CROSS_BOUNDARY_TARGET", results[0].MatchContent);
+            }
+            finally
+            {
+                HybridIoDispatcher.MaxChunkSize = originalMaxChunk;
+            }
+        }
+
+        [Fact]
+        public async Task Test_SearchEngine_ChunkBoundary_PreservesMonotonicGlobalLineNumbers()
+        {
+            int originalMaxChunk = HybridIoDispatcher.MaxChunkSize;
+            try
+            {
+                // Set chunk size to 128 bytes to create multiple chunks
+                HybridIoDispatcher.MaxChunkSize = 128;
+
+                string filePath = Path.Combine(_tempDir, "monotonic_lines.txt");
+
+                using (var writer = new StreamWriter(filePath))
+                {
+                    for (int i = 1; i <= 30; i++)
+                    {
+                        if (i == 3)
+                        {
+                            writer.WriteLine($"Line {i}: KEYWORD_ALPHA in chunk 0");
+                        }
+                        else if (i == 12)
+                        {
+                            writer.WriteLine($"Line {i}: KEYWORD_BETA in middle chunk");
+                        }
+                        else if (i == 25)
+                        {
+                            writer.WriteLine($"Line {i}: KEYWORD_GAMMA in later chunk");
+                        }
+                        else
+                        {
+                            writer.WriteLine($"Line {i}: filler padding content for test");
+                        }
+                    }
+                }
+
+                var engine = new SearchEngine(_tempDir);
+
+                var resultsAlpha = await engine.SearchAsync("KEYWORD_ALPHA", isRegex: false, caseSensitive: true, contextLines: 0, fileGlobs: new[] { "monotonic_lines.txt" });
+                Assert.Single(resultsAlpha);
+                Assert.Equal(3, resultsAlpha[0].LineNumber);
+
+                var resultsBeta = await engine.SearchAsync("KEYWORD_BETA", isRegex: false, caseSensitive: true, contextLines: 0, fileGlobs: new[] { "monotonic_lines.txt" });
+                Assert.Single(resultsBeta);
+                Assert.Equal(12, resultsBeta[0].LineNumber);
+
+                var resultsGamma = await engine.SearchAsync("KEYWORD_GAMMA", isRegex: false, caseSensitive: true, contextLines: 0, fileGlobs: new[] { "monotonic_lines.txt" });
+                Assert.Single(resultsGamma);
+                Assert.Equal(25, resultsGamma[0].LineNumber);
+            }
+            finally
+            {
+                HybridIoDispatcher.MaxChunkSize = originalMaxChunk;
+            }
         }
     }
 }

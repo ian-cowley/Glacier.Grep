@@ -165,24 +165,35 @@ namespace Glacier.Grep
             bool invertMatch,
             List<SearchResult> results)
         {
-            HybridIoDispatcher.ProcessFile(task.FullPath, task.Length, (ReadOnlySpan<byte> fileData) =>
+            var context = new FileSearchContext();
+            int overlapMargin = 0;
+            if (regex != null)
             {
-                if (fileData.Length == 0) return;
+                overlapMargin = 4096;
+            }
+            else if (patternBytes.Length > 1)
+            {
+                overlapMargin = patternBytes.Length - 1;
+            }
 
-                // Skip binary files unless searchBinary is true
-                if (!searchBinary && IsBinaryFile(fileData)) return;
+            HybridIoDispatcher.ProcessFile(task.FullPath, task.Length, overlapMargin, (ReadOnlySpan<byte> chunkData, long chunkStartOffset, long logicalStartOffset, long logicalEndOffset, long totalLength, bool isLastChunk) =>
+            {
+                if (chunkData.Length == 0) return;
+
+                // Skip binary files unless searchBinary is true (only check on the first chunk)
+                if (!searchBinary && chunkStartOffset == 0 && IsBinaryFile(chunkData)) return;
 
                 if (invertMatch)
                 {
-                    SearchInverted(fileData, task, patternBytes, regex, caseSensitive, contextLines, results);
+                    SearchInverted(chunkData, task, patternBytes, regex, caseSensitive, contextLines, results, context, chunkStartOffset, logicalStartOffset, logicalEndOffset);
                 }
                 else if (regex != null)
                 {
-                    SearchRegex(fileData, task, regex, contextLines, results);
+                    SearchRegex(chunkData, task, regex, contextLines, results, context, chunkStartOffset, logicalStartOffset, logicalEndOffset);
                 }
                 else
                 {
-                    SearchLiteral(fileData, task, patternBytes, searchBytes, caseSensitive, contextLines, results);
+                    SearchLiteral(chunkData, task, patternBytes, searchBytes, caseSensitive, contextLines, results, context, chunkStartOffset, logicalStartOffset, logicalEndOffset);
                 }
             });
         }
@@ -200,13 +211,18 @@ namespace Glacier.Grep
             SearchValues<byte>? searchBytes,
             bool caseSensitive,
             int contextLines,
-            List<SearchResult> results)
+            List<SearchResult> results,
+            FileSearchContext context,
+            long chunkStartOffset,
+            long logicalStartOffset,
+            long logicalEndOffset)
         {
             if (patternBytes.Length == 0) return;
 
             int m = patternBytes.Length;
-            int lastNewlineOffset = 0;
-            int currentLineNumber = 1;
+            int overlap = (int)(logicalStartOffset - chunkStartOffset);
+            int lastNewlineOffset = overlap;
+            long currentLineNumber = context.GlobalLineNumber;
 
             if (caseSensitive || m == 1)
             {
@@ -235,6 +251,16 @@ namespace Glacier.Grep
 
                     if (isMatch)
                     {
+                        // Boundary match deduplication:
+                        // If this is a subsequent chunk and the match ends at or before logicalStartOffset,
+                        // it was already emitted in the previous chunk.
+                        long matchFileOffset = chunkStartOffset + offset;
+                        if (chunkStartOffset > 0 && matchFileOffset + m <= logicalStartOffset)
+                        {
+                            offset += m;
+                            continue;
+                        }
+
                         int lineStart = fileData.Slice(0, offset).LastIndexOf((byte)'\n') + 1;
                         int lineEnd = fileData.Slice(offset).IndexOf((byte)'\n');
                         if (lineEnd < 0) lineEnd = fileData.Length;
@@ -244,15 +270,18 @@ namespace Glacier.Grep
                         if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
                             lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
 
-                        currentLineNumber += fileData.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count((byte)'\n');
-                        lastNewlineOffset = lineStart;
+                        if (lineStart > lastNewlineOffset)
+                        {
+                            currentLineNumber += fileData.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count((byte)'\n');
+                            lastNewlineOffset = lineStart;
+                        }
 
                         string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
 
                         var result = new SearchResult
                         {
                             FilePath = relativePath,
-                            LineNumber = currentLineNumber,
+                            LineNumber = (int)currentLineNumber,
                             MatchContent = Encoding.UTF8.GetString(lineSpan),
                             MatchStartIndex = offset - lineStart,
                             MatchLength = m
@@ -297,6 +326,14 @@ namespace Glacier.Grep
                 {
                     if (EqualsIgnoreCaseAscii(fileData.Slice(offset, m), patternBytes))
                     {
+                        // Boundary match deduplication:
+                        long matchFileOffset = chunkStartOffset + offset;
+                        if (chunkStartOffset > 0 && matchFileOffset + m <= logicalStartOffset)
+                        {
+                            offset += m;
+                            continue;
+                        }
+
                         int lineStart = fileData.Slice(0, offset).LastIndexOf((byte)'\n') + 1;
                         int lineEnd = fileData.Slice(offset).IndexOf((byte)'\n');
                         if (lineEnd < 0) lineEnd = fileData.Length;
@@ -306,15 +343,18 @@ namespace Glacier.Grep
                         if (lineSpan.Length > 0 && lineSpan[^1] == '\r')
                             lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
 
-                        currentLineNumber += fileData.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count((byte)'\n');
-                        lastNewlineOffset = lineStart;
+                        if (lineStart > lastNewlineOffset)
+                        {
+                            currentLineNumber += fileData.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count((byte)'\n');
+                            lastNewlineOffset = lineStart;
+                        }
 
                         string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
 
                         var result = new SearchResult
                         {
                             FilePath = relativePath,
-                            LineNumber = currentLineNumber,
+                            LineNumber = (int)currentLineNumber,
                             MatchContent = Encoding.UTF8.GetString(lineSpan),
                             MatchStartIndex = offset - lineStart,
                             MatchLength = m
@@ -337,6 +377,15 @@ namespace Glacier.Grep
                     }
                 }
             }
+
+            // Count remaining newlines up to logical end of this chunk
+            int logicalEndIndex = (int)(logicalEndOffset - chunkStartOffset);
+            if (logicalEndIndex > lastNewlineOffset)
+            {
+                currentLineNumber += fileData.Slice(lastNewlineOffset, logicalEndIndex - lastNewlineOffset).Count((byte)'\n');
+            }
+            context.GlobalLineNumber = currentLineNumber;
+            context.LastProcessedFileOffset = logicalEndOffset;
         }
 
         private void SearchRegex(
@@ -344,7 +393,11 @@ namespace Glacier.Grep
             FileSearchTask task,
             Regex regex,
             int contextLines,
-            List<SearchResult> results)
+            List<SearchResult> results,
+            FileSearchContext context,
+            long chunkStartOffset,
+            long logicalStartOffset,
+            long logicalEndOffset)
         {
             // Rent a char buffer to decode the whole file at once (drastically reduces overhead of line-by-line decoding)
             int maxCharCount = Encoding.UTF8.GetMaxCharCount(fileData.Length);
@@ -355,15 +408,26 @@ namespace Glacier.Grep
                 int charCount = Encoding.UTF8.GetChars(fileData, charBuffer);
                 ReadOnlySpan<char> fileChars = charBuffer.AsSpan(0, charCount);
 
+                int overlap = (int)(logicalStartOffset - chunkStartOffset);
+                int logicalStartChar = (overlap == 0) ? 0 : Encoding.UTF8.GetCharCount(fileData.Slice(0, overlap));
+                int logicalEndIndex = (int)(logicalEndOffset - chunkStartOffset);
+                int logicalEndChar = Encoding.UTF8.GetCharCount(fileData.Slice(0, logicalEndIndex));
+
                 var enumerator = regex.EnumerateMatches(fileChars);
-                int lastNewlineOffset = 0;
-                int currentLineNumber = 1;
+                int lastNewlineOffset = logicalStartChar;
+                long currentLineNumber = context.GlobalLineNumber;
 
                 while (enumerator.MoveNext())
                 {
                     var match = enumerator.Current;
                     int matchStart = match.Index;
                     int matchLength = match.Length;
+
+                    // Deduplication: if match is entirely within the overlap preceding logical start, skip it
+                    if (chunkStartOffset > 0 && matchStart + matchLength <= logicalStartChar)
+                    {
+                        continue;
+                    }
 
                     // Find line boundaries in char space
                     int lineStart = fileChars.Slice(0, matchStart).LastIndexOf('\n') + 1;
@@ -376,8 +440,11 @@ namespace Glacier.Grep
                         lineSpan = lineSpan.Slice(0, lineSpan.Length - 1);
 
                     // Incremental line number counting
-                    currentLineNumber += fileChars.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count('\n');
-                    lastNewlineOffset = lineStart;
+                    if (lineStart > lastNewlineOffset)
+                    {
+                        currentLineNumber += fileChars.Slice(lastNewlineOffset, lineStart - lastNewlineOffset).Count('\n');
+                        lastNewlineOffset = lineStart;
+                    }
 
                     // Lazy relative path calculation
                     string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
@@ -385,7 +452,7 @@ namespace Glacier.Grep
                     var result = new SearchResult
                     {
                         FilePath = relativePath,
-                        LineNumber = currentLineNumber,
+                        LineNumber = (int)currentLineNumber,
                         MatchContent = new string(lineSpan),
                         MatchStartIndex = matchStart - lineStart,
                         MatchLength = matchLength
@@ -399,6 +466,13 @@ namespace Glacier.Grep
 
                     results.Add(result);
                 }
+
+                if (logicalEndChar > lastNewlineOffset)
+                {
+                    currentLineNumber += fileChars.Slice(lastNewlineOffset, logicalEndChar - lastNewlineOffset).Count('\n');
+                }
+                context.GlobalLineNumber = currentLineNumber;
+                context.LastProcessedFileOffset = logicalEndOffset;
             }
             finally
             {
@@ -413,10 +487,15 @@ namespace Glacier.Grep
             Regex? regex,
             bool caseSensitive,
             int contextLines,
-            List<SearchResult> results)
+            List<SearchResult> results,
+            FileSearchContext context,
+            long chunkStartOffset,
+            long logicalStartOffset,
+            long logicalEndOffset)
         {
+            int overlap = (int)(logicalStartOffset - chunkStartOffset);
             int offset = 0;
-            int lineNumber = 1;
+            long lineNumber = context.GlobalLineNumber;
             int maxLineLength = 16384;
             char[] charBuffer = ArrayPool<char>.Shared.Rent(maxLineLength);
 
@@ -436,6 +515,20 @@ namespace Glacier.Grep
                     {
                         currentLineEnd = offset + lineEnd;
                         nextOffset = currentLineEnd + 1;
+                    }
+
+                    // If this line ended before or at logical start in an overlap region, skip
+                    if (chunkStartOffset > 0 && currentLineEnd <= overlap)
+                    {
+                        offset = nextOffset;
+                        continue;
+                    }
+
+                    // If this line starts at or after logical end of chunk, stop (next chunk will process it)
+                    int logicalEndIndex = (int)(logicalEndOffset - chunkStartOffset);
+                    if (offset >= logicalEndIndex)
+                    {
+                        break;
                     }
 
                     ReadOnlySpan<byte> lineSpan = fileData.Slice(offset, currentLineEnd - offset);
@@ -472,13 +565,12 @@ namespace Glacier.Grep
 
                     if (!hasMatch)
                     {
-                        // Lazy relative path calculation
                         string relativePath = Path.GetRelativePath(_rootDir, task.FullPath);
 
                         var result = new SearchResult
                         {
                             FilePath = relativePath,
-                            LineNumber = lineNumber,
+                            LineNumber = (int)lineNumber,
                             MatchContent = Encoding.UTF8.GetString(lineSpan),
                             MatchStartIndex = 0,
                             MatchLength = lineSpan.Length
@@ -496,6 +588,9 @@ namespace Glacier.Grep
                     lineNumber++;
                     offset = nextOffset;
                 }
+
+                context.GlobalLineNumber = lineNumber;
+                context.LastProcessedFileOffset = logicalEndOffset;
             }
             finally
             {
