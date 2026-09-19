@@ -131,6 +131,14 @@ To eliminate Windows OS section object and view creation overhead on medium-size
 
 ---
 
+## 🆕 What's New in v1.0.1
+
+- **1 GB chunk overlap margin corrected** — boundary formula fixed to `chunkOffset - patternLength + 1`, preventing missed matches spanning chunk boundaries.
+- **Monotonic global line numbering across chunk boundaries** — line numbers are now globally consistent regardless of how the file is split into chunks.
+- **14 tests** passing (100 %).
+
+---
+
 ## Credits
 
 Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
