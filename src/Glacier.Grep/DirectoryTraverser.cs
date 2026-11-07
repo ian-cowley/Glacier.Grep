@@ -92,14 +92,6 @@ namespace Glacier.Grep
                 return false;
             }
 
-            if (fileName.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
-                fileName.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
-                fileName.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
-                fileName.Equals("release", StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
             // Normalize path using stack-allocated span
             ReadOnlySpan<char> dir = entry.Directory;
             int totalLen = dir.Length + 1 + fileName.Length;
@@ -152,8 +144,7 @@ namespace Glacier.Grep
             // Always skip build output/noisy folders
             if (dirName.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
                 dirName.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
-                dirName.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
-                dirName.Equals("release", StringComparison.OrdinalIgnoreCase))
+                dirName.Equals("node_modules", StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }

@@ -85,4 +85,43 @@ public class GrepEdgeCaseTests : IDisposable
         Assert.Equal(3, results[1].LineNumber);
         Assert.Equal(5, results[2].LineNumber);
     }
+
+    [Fact]
+    public async Task DirectoryTraverser_DoesNotSkipReleaseFolderOrFile()
+    {
+        string relDir = Path.Combine(_tempDir, "release");
+        string docsDir = Path.Combine(_tempDir, "docs");
+        Directory.CreateDirectory(relDir);
+        Directory.CreateDirectory(docsDir);
+        File.WriteAllText(Path.Combine(relDir, "notes.txt"), "SHIP_READY_TOKEN");
+        File.WriteAllText(Path.Combine(docsDir, "RELEASE"), "SHIP_READY_TOKEN");
+
+        var engine = new SearchEngine(_tempDir);
+        var results = await engine.SearchAsync("SHIP_READY_TOKEN", isRegex: false, caseSensitive: true, contextLines: 0, fileGlobs: null);
+        Assert.Equal(2, results.Count);
+    }
+
+    [Fact]
+    public async Task McpServer_InitializeToolsListAndSearchGrep_WorkEndToEndWithoutReflection()
+    {
+        File.WriteAllText(Path.Combine(_tempDir, "sample.cs"), "public class McpVerifiedTarget { }");
+        string escapedPath = _tempDir.Replace("\\", "\\\\");
+
+        string requests =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n" +
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n" +
+            $"{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"search_grep\",\"arguments\":{{\"query\":\"McpVerifiedTarget\",\"path\":\"{escapedPath}\"}}}}}}\n";
+
+        using var input = new MemoryStream(Encoding.UTF8.GetBytes(requests));
+        using var output = new MemoryStream();
+
+        var server = new Glacier.Grep.Host.Mcp.McpServer(input, output);
+        await server.RunAsync();
+
+        string[] lines = Encoding.UTF8.GetString(output.ToArray()).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(3, lines.Length);
+        Assert.Contains("\"protocolVersion\":\"2024-11-05\"", lines[0]);
+        Assert.Contains("\"search_grep\"", lines[1]);
+        Assert.Contains("McpVerifiedTarget", lines[2]);
+    }
 }

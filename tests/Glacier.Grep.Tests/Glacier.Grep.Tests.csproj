@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <LangVersion>preview</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 
   <ItemGroup>
@@ -21,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Glacier.Grep\Glacier.Grep.csproj" />
+    <ProjectReference Include="..\..\src\Glacier.Grep.Host\Glacier.Grep.Host.csproj" />
   </ItemGroup>
 
 </Project>

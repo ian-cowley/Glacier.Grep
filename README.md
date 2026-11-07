@@ -116,11 +116,8 @@ Glacier.Grep is engineered in pure C# .NET 10 to saturate CPU memory bandwidth. 
 | `"ThreadIndependentReaderWriterLock"` | Case-Insensitive | **115.7 ms** | 142.3 ms | ⚡ **Near-Parity** (within 1.23x of Rust) |
 | `"public class"` | Case-Insensitive | **137.9 ms** | 210.4 ms | 🔹 Ripgrep leads (within 1.52x of Rust) |
 
-### Memory-Mapped File Pooling (PB-21 Optimization)
-To eliminate Windows OS section object and view creation overhead on medium-sized files (1MB to 8MB), `Glacier.Grep` utilizes an 8MB anonymous `MemoryMappedFile` handle pool (`s_mediumMmfPool`):
-- **Medium File Processing**: 2MB file processing and 30,000-line search completed in **23.27 ms** on AMD Ryzen AI 9 HX 370.
-- **Section Handle Churn**: Reduced by 100% via pooled view re-mapping (`CreateViewAccessor(0, fileLen)`).
-- **Test Suite**: 14/14 unit, regex, ignore rule, and MCP tests pass cleanly.
+### File-Backed Memory Mapping & Bounded Chunking
+For files >= 1 MB, HybridIoDispatcher maps files directly from the OS page cache via file-backed MemoryMappedFile.CreateFromFile using 16 MB UTF-8 codepoint-aligned windows, avoiding swap-backed copies and multi-gigabyte regex decode buffers.
 
 ---
 
@@ -133,11 +130,11 @@ To eliminate Windows OS section object and view creation overhead on medium-size
 
 ---
 
-## 🆕 What's New in v1.0.1
+## 🆕 What's New in v1.1.0
 
-- **1 GB chunk overlap margin corrected** — boundary formula fixed to `chunkOffset - patternLength + 1`, preventing missed matches spanning chunk boundaries.
-- **Monotonic global line numbering across chunk boundaries** — line numbers are now globally consistent regardless of how the file is split into chunks.
-- **14 tests** passing (100 %).
+- **Genuine file-backed memory mapping & UTF-8 codepoint-safe 16 MB chunking** — eliminates anonymous swap copies, multi-GB regex char[] allocations, and split UTF-8 codepoints at chunk boundaries.
+- **100% Native AOT MCP Server** — strongly-typed source-generated McpJsonContext JSON-RPC envelopes for initialize, 	ools/list, and 	ools/call with end-to-end tests.
+- **Accurate directory traversal** — removed hardcoded skipping of legitimate elease/ folders and RELEASE files.
 
 ---
 

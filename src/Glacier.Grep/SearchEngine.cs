@@ -399,8 +399,8 @@ namespace Glacier.Grep
             long logicalStartOffset,
             long logicalEndOffset)
         {
-            // Rent a char buffer to decode the whole file at once (drastically reduces overhead of line-by-line decoding)
-            int maxCharCount = Encoding.UTF8.GetMaxCharCount(fileData.Length);
+            // Rent a bounded char buffer (UTF-8 byte length is an upper bound on UTF-16 char count)
+            int maxCharCount = Math.Max(1, fileData.Length);
             char[] charBuffer = ArrayPool<char>.Shared.Rent(maxCharCount);
 
             try

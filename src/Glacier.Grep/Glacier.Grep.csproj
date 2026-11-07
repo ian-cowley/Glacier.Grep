@@ -3,22 +3,22 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <!-- NuGet Packaging Properties -->
-    <Version>1.0.2</Version>
+    <Version>1.1.0</Version>
     <PackageId>Glacier.Grep</PackageId>
     <IsAotCompatible>true</IsAotCompatible>
     <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier</Company>
-    <Description>High-performance, zero-allocation, SIMD-accelerated C# search engine and index for .NET 10. Built for speed and efficiency with zero-copy semantics and MCP support.</Description>
-    <PackageTags>grep search file-search simd dotnet csharp high-performance regex mcp</PackageTags>
+    <Description>High-performance, SIMD-accelerated C# search engine for .NET 10 with file-backed memory mapping, gitignore pruning, and Native AOT MCP support.</Description>
+    <PackageTags>grep search file-search simd dotnet csharp high-performance regex mcp aot</PackageTags>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Grep</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <!-- High Performance Optimizations -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TieredPGO>true</TieredPGO>
-    <ServerGarbageCollection>true</ServerGarbageCollection>
     <LangVersion>preview</LangVersion>
   </PropertyGroup>
   <ItemGroup>

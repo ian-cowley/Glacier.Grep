@@ -1,9 +1,7 @@
 using System;
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.IO;
 using System.IO.MemoryMappedFiles;
-using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace Glacier.Grep
@@ -25,9 +23,9 @@ namespace Glacier.Grep
         bool isLastChunk);
 
     /// <summary>
-    /// Hybrid I/O Dispatcher that routes I/O patterns based on file size
-    /// to bypass stream buffer overhead and utilize zero-copy memory mapping or pooled array blocks.
-    /// Pools MemoryMappedFile handles on medium files (1-8 MB) to eliminate OS section and view churn.
+    /// Hybrid I/O Dispatcher that routes small files (&lt;1 MB) through pooled <see cref="RandomAccess"/> buffers
+    /// and medium/large files (&gt;=1 MB or &gt;<see cref="MaxChunkSize"/>) through genuine zero-copy OS file-backed
+    /// <see cref="MemoryMappedFile"/> views with UTF-8 codepoint-safe chunk boundaries.
     /// </summary>
     public static class HybridIoDispatcher
     {
@@ -35,78 +33,19 @@ namespace Glacier.Grep
         public const long EightMegaBytes = 8 * 1024 * 1024;
 
         /// <summary>
-        /// Maximum chunk size for memory mapped file processing. Defaults to 1 GB.
+        /// Maximum chunk size for memory-mapped file processing. Defaults to 16 MB to bound per-worker decode buffers.
         /// Configurable for testing boundary conditions with small chunks.
         /// </summary>
-        public static int MaxChunkSize { get; set; } = 1024 * 1024 * 1024;
-
-        private static readonly ConcurrentQueue<PooledMmfHandle> s_mediumMmfPool = new();
-        private static int s_pooledCount = 0;
-        private static readonly int s_maxPooledHandles = Math.Max(4, Environment.ProcessorCount * 2);
-
-        /// <summary>
-        /// Represents a pooled 8MB anonymous MemoryMappedFile handle and view accessor,
-        /// eliminating OS file mapping handle churn (CreateFileMapping / MapViewOfFile / UnmapViewOfFile)
-        /// for medium files (1-8 MB).
-        /// </summary>
-        private sealed unsafe class PooledMmfHandle : IDisposable
-        {
-            public readonly MemoryMappedFile Mmf;
-            public readonly MemoryMappedViewAccessor Accessor;
-            public readonly byte* Pointer;
-
-            public PooledMmfHandle(long capacity = EightMegaBytes)
-            {
-                Mmf = MemoryMappedFile.CreateNew(null, capacity, MemoryMappedFileAccess.ReadWrite);
-                Accessor = Mmf.CreateViewAccessor(0, capacity, MemoryMappedFileAccess.ReadWrite);
-                byte* ptr = null;
-                Accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
-                Pointer = ptr + Accessor.PointerOffset;
-            }
-
-            public void Dispose()
-            {
-                try { Accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
-                try { Accessor.Dispose(); } catch { }
-                try { Mmf.Dispose(); } catch { }
-            }
-        }
-
-        private static PooledMmfHandle RentMediumHandle()
-        {
-            if (s_mediumMmfPool.TryDequeue(out var handle))
-            {
-                Interlocked.Decrement(ref s_pooledCount);
-                return handle;
-            }
-            return new PooledMmfHandle(EightMegaBytes);
-        }
-
-        private static void ReturnMediumHandle(PooledMmfHandle handle)
-        {
-            if (Interlocked.Increment(ref s_pooledCount) <= s_maxPooledHandles)
-            {
-                s_mediumMmfPool.Enqueue(handle);
-            }
-            else
-            {
-                Interlocked.Decrement(ref s_pooledCount);
-                handle.Dispose();
-            }
-        }
+        public static int MaxChunkSize { get; set; } = 16 * 1024 * 1024;
 
         public static void ClearPool()
         {
-            while (s_mediumMmfPool.TryDequeue(out var handle))
-            {
-                handle.Dispose();
-            }
-            s_pooledCount = 0;
+            // Retained for public API compatibility; file-backed MemoryMappedFile views release deterministically per call.
         }
 
         public static void ProcessFile(string path, long length, FileDataProcessor processor)
         {
-            ProcessFile(path, length, 0, (chunk, start, lStart, lEnd, total, isLast) => processor(chunk));
+            ProcessFile(path, length, 0, (chunk, _, _, _, _, _) => processor(chunk));
         }
 
         public static void ProcessFile(string path, long length, int overlapMargin, FileChunkProcessor processor)
@@ -117,53 +56,14 @@ namespace Glacier.Grep
                 return;
             }
 
-            int maxChunk = MaxChunkSize;
-            if (length <= maxChunk)
+            int maxChunk = Math.Max(64, MaxChunkSize);
+            if (length < OneMegaByte && length <= maxChunk)
             {
-                if (length < OneMegaByte)
-                {
-                    ProcessRentedArray(path, (int)length, span => processor(span, 0, 0, length, length, true));
-                }
-                else if (length <= EightMegaBytes)
-                {
-                    ProcessMediumFilePooled(path, (int)length, span => processor(span, 0, 0, length, length, true));
-                }
-                else
-                {
-                    ProcessMemoryMapped(path, length, overlapMargin, processor);
-                }
+                ProcessRentedArray(path, (int)length, span => processor(span, 0, 0, span.Length, span.Length, true));
             }
             else
             {
-                ProcessMemoryMapped(path, length, overlapMargin, processor);
-            }
-        }
-
-        private static unsafe void ProcessMediumFilePooled(string path, int length, FileDataProcessor processor)
-        {
-            var pooledHandle = RentMediumHandle();
-            try
-            {
-                using SafeFileHandle fileHandle = File.OpenHandle(
-                    path,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.Read,
-                    FileOptions.SequentialScan);
-
-                int totalRead = 0;
-                while (totalRead < length)
-                {
-                    int read = RandomAccess.Read(fileHandle, new Span<byte>(pooledHandle.Pointer + totalRead, length - totalRead), totalRead);
-                    if (read == 0) break;
-                    totalRead += read;
-                }
-
-                processor(new ReadOnlySpan<byte>(pooledHandle.Pointer, totalRead));
-            }
-            finally
-            {
-                ReturnMediumHandle(pooledHandle);
+                ProcessMemoryMapped(path, length, overlapMargin, maxChunk, processor);
             }
         }
 
@@ -173,12 +73,11 @@ namespace Glacier.Grep
             try
             {
                 using SafeFileHandle handle = File.OpenHandle(
-                    path, 
-                    FileMode.Open, 
-                    FileAccess.Read, 
-                    FileShare.Read, 
-                    FileOptions.SequentialScan
-                );
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite,
+                    FileOptions.SequentialScan);
 
                 int bytesRead = RandomAccess.Read(handle, rented.AsSpan(0, length), 0);
                 processor(rented.AsSpan(0, bytesRead));
@@ -189,62 +88,93 @@ namespace Glacier.Grep
             }
         }
 
-        private static void ProcessMemoryMapped(string path, long length, int overlapMargin, FileChunkProcessor processor)
+        private static unsafe void ProcessMemoryMapped(
+            string path,
+            long length,
+            int overlapMargin,
+            int maxChunk,
+            FileChunkProcessor processor)
         {
-            using var mmf = MemoryMappedFile.CreateFromFile(
-                path, 
-                FileMode.Open, 
-                null, 
-                0, 
-                MemoryMappedFileAccess.Read
-            );
-            using var accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-            
-            unsafe
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, bufferSize: 1, FileOptions.SequentialScan);
+            long actualLength = fs.Length;
+            if (actualLength <= 0)
             {
-                byte* pointer = null;
-                accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
-                try
+                processor(ReadOnlySpan<byte>.Empty, 0, 0, 0, 0, true);
+                return;
+            }
+
+            using var mmf = MemoryMappedFile.CreateFromFile(
+                fs,
+                mapName: null,
+                capacity: 0,
+                MemoryMappedFileAccess.Read,
+                HandleInheritability.None,
+                leaveOpen: false);
+
+            using var accessor = mmf.CreateViewAccessor(0, actualLength, MemoryMappedFileAccess.Read);
+
+            byte* pointer = null;
+            accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
+            try
+            {
+                byte* start = pointer + accessor.PointerOffset;
+                long capacity = actualLength;
+
+                if (capacity <= maxChunk)
                 {
-                    byte* start = pointer + accessor.PointerOffset;
-                    long capacity = accessor.Capacity;
-
-                    int maxChunk = MaxChunkSize;
-                    if (capacity <= maxChunk)
-                    {
-                        var fileData = new ReadOnlySpan<byte>(start, (int)capacity);
-                        processor(fileData, 0, 0, capacity, capacity, true);
-                    }
-                    else
-                    {
-                        int overlap = Math.Max(0, overlapMargin);
-                        if (overlap > maxChunk / 2)
-                        {
-                            overlap = maxChunk / 2;
-                        }
-
-                        long logicalOffset = 0;
-                        while (logicalOffset < capacity)
-                        {
-                            long logicalEnd = Math.Min(logicalOffset + maxChunk, capacity);
-                            long chunkStart = (logicalOffset == 0) ? 0 : logicalOffset - overlap;
-                            long chunkEnd = logicalEnd;
-                            int chunkSize = (int)(chunkEnd - chunkStart);
-
-                            bool isLast = (logicalEnd >= capacity);
-                            var fileData = new ReadOnlySpan<byte>(start + chunkStart, chunkSize);
-
-                            processor(fileData, chunkStart, logicalOffset, logicalEnd, capacity, isLast);
-
-                            logicalOffset = logicalEnd;
-                        }
-                    }
+                    var fileData = new ReadOnlySpan<byte>(start, (int)capacity);
+                    processor(fileData, 0, 0, capacity, capacity, true);
                 }
-                finally
+                else
                 {
-                    accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+                    int overlap = Math.Max(0, overlapMargin);
+                    if (overlap > maxChunk / 2)
+                    {
+                        overlap = maxChunk / 2;
+                    }
+
+                    long logicalOffset = 0;
+                    while (logicalOffset < capacity)
+                    {
+                        long logicalEnd = Math.Min(logicalOffset + maxChunk, capacity);
+
+                        // Avoid splitting multi-byte UTF-8 codepoints across logicalEnd
+                        if (logicalEnd < capacity)
+                        {
+                            int backtrack = 0;
+                            while (backtrack < 3 && logicalEnd - backtrack > logicalOffset + 1 && IsUtf8ContinuationByte(start[logicalEnd - backtrack]))
+                            {
+                                backtrack++;
+                            }
+                            logicalEnd -= backtrack;
+                        }
+
+                        long chunkStart = (logicalOffset == 0) ? 0 : Math.Max(0, logicalOffset - overlap);
+                        // Advance chunkStart past any leading UTF-8 continuation bytes in the overlap prefix
+                        if (chunkStart > 0)
+                        {
+                            while (chunkStart < logicalOffset && IsUtf8ContinuationByte(start[chunkStart]))
+                            {
+                                chunkStart++;
+                            }
+                        }
+
+                        int chunkSize = (int)(logicalEnd - chunkStart);
+                        bool isLast = (logicalEnd >= capacity);
+                        var fileData = new ReadOnlySpan<byte>(start + chunkStart, chunkSize);
+
+                        processor(fileData, chunkStart, logicalOffset, logicalEnd, capacity, isLast);
+
+                        logicalOffset = logicalEnd;
+                    }
                 }
             }
+            finally
+            {
+                accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+            }
         }
+
+        private static bool IsUtf8ContinuationByte(byte b) => (b & 0xC0) == 0x80;
     }
 }

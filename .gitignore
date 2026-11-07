@@ -2,7 +2,7 @@
 [Bb]in/
 [Oo]bj/
 [Rr]elease/
-publish/
+TestResults/
 
 # IDE and editor folders
 .vs/
@@ -29,6 +29,7 @@ packages/
 
 # Logs
 *.log
+mcp_log.txt
 ncrunch*
 
 # OS files
@@ -38,3 +39,8 @@ Thumbs.db
 # Scratch / working directories
 brain/
 scratch/
+
+# Secrets & local configuration (Zero Secrets Policy)
+appsettings*.json
+!appsettings.template.json
+*.env*
