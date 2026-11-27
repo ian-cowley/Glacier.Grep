@@ -138,15 +138,33 @@ namespace Glacier.Grep
                     {
                         long logicalEnd = Math.Min(logicalOffset + maxChunk, capacity);
 
-                        // Avoid splitting multi-byte UTF-8 codepoints across logicalEnd
+                        // Align logicalEnd to the next newline boundary (within 64 KB) so complete lines stay in one chunk.
+                        // Otherwise backtrack past any split multi-byte UTF-8 continuation bytes.
                         if (logicalEnd < capacity)
                         {
-                            int backtrack = 0;
-                            while (backtrack < 3 && logicalEnd - backtrack > logicalOffset + 1 && IsUtf8ContinuationByte(start[logicalEnd - backtrack]))
+                            long scanLimit = Math.Min(capacity, logicalEnd + 65536);
+                            long scan = logicalEnd;
+                            bool foundNewline = false;
+                            while (scan < scanLimit)
                             {
-                                backtrack++;
+                                if (start[scan] == (byte)'\n')
+                                {
+                                    logicalEnd = scan + 1;
+                                    foundNewline = true;
+                                    break;
+                                }
+                                scan++;
                             }
-                            logicalEnd -= backtrack;
+
+                            if (!foundNewline)
+                            {
+                                int backtrack = 0;
+                                while (backtrack < 3 && logicalEnd - backtrack > logicalOffset + 1 && IsUtf8ContinuationByte(start[logicalEnd - backtrack]))
+                                {
+                                    backtrack++;
+                                }
+                                logicalEnd -= backtrack;
+                            }
                         }
 
                         long chunkStart = (logicalOffset == 0) ? 0 : Math.Max(0, logicalOffset - overlap);

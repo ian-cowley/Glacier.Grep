@@ -423,8 +423,8 @@ namespace Glacier.Grep
                     int matchStart = match.Index;
                     int matchLength = match.Length;
 
-                    // Deduplication: if match is entirely within the overlap preceding logical start, skip it
-                    if (chunkStartOffset > 0 && matchStart + matchLength <= logicalStartChar)
+                    // Deduplication: if match starts before logical start or at/after logical end, skip it
+                    if ((chunkStartOffset > 0 && matchStart < logicalStartChar) || matchStart >= logicalEndChar)
                     {
                         continue;
                     }
@@ -517,8 +517,8 @@ namespace Glacier.Grep
                         nextOffset = currentLineEnd + 1;
                     }
 
-                    // If this line ended before or at logical start in an overlap region, skip
-                    if (chunkStartOffset > 0 && currentLineEnd <= overlap)
+                    // If this line started before logical start (overlap region already covered by previous chunk), skip
+                    if (chunkStartOffset > 0 && offset < overlap)
                     {
                         offset = nextOffset;
                         continue;

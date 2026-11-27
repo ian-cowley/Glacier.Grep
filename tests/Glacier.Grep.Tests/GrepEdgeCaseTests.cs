@@ -124,4 +124,36 @@ public class GrepEdgeCaseTests : IDisposable
         Assert.Contains("\"search_grep\"", lines[1]);
         Assert.Contains("McpVerifiedTarget", lines[2]);
     }
+
+    [Fact]
+    public async Task SearchEngine_RegexAndInvertedAcrossChunkBoundary_NoDuplicatesOrTruncation()
+    {
+        string file = Path.Combine(_tempDir, "chunk_boundary.txt");
+        var sb = new StringBuilder();
+        for (int i = 1; i <= 40; i++)
+        {
+            sb.Append($"line_{i:D2}_marker_alpha_beta_gamma_1234567890\n");
+        }
+        File.WriteAllText(file, sb.ToString());
+
+        int origMax = HybridIoDispatcher.MaxChunkSize;
+        HybridIoDispatcher.MaxChunkSize = 256; // force many chunk boundaries mid-line
+        try
+        {
+            var engine = new SearchEngine(_tempDir);
+            var regexResults = await engine.SearchAsync(@"marker_alpha_beta_gamma_\d+", isRegex: true, caseSensitive: true, contextLines: 0, fileGlobs: null);
+            Assert.Equal(40, regexResults.Count);
+            for (int i = 0; i < 40; i++)
+            {
+                Assert.Equal(i + 1, regexResults[i].LineNumber);
+            }
+
+            var invResults = await engine.SearchAsync("NONEXISTENT_TOKEN_XYZ", isRegex: false, caseSensitive: true, contextLines: 0, fileGlobs: null, invertMatch: true);
+            Assert.Equal(40, invResults.Count);
+        }
+        finally
+        {
+            HybridIoDispatcher.MaxChunkSize = origMax;
+        }
+    }
 }
