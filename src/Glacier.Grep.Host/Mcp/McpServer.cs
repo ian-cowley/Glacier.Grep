@@ -178,7 +178,11 @@ namespace Glacier.Grep.Host.Mcp
                     Log($"CRITICAL error: {ex.Message}");
                     if (requestId.ValueKind != JsonValueKind.Undefined)
                     {
-                        try { await SendErrorAsync(requestId, -32603, $"Internal Server Error: {ex.Message}"); } catch { }
+                        try { await SendErrorAsync(requestId, -32603, $"Internal Server Error: {ex.Message}"); }
+                        catch (Exception sendEx) when (sendEx is IOException or ObjectDisposedException or InvalidOperationException)
+                        {
+                            Log($"Failed to send error response: {sendEx.Message}");
+                        }
                     }
                 }
             }
