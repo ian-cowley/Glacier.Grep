@@ -12,6 +12,7 @@ namespace Glacier.Grep
         public int MatchStartIndex { get; }
         public int MatchLength { get; }
         public int LineNumber { get; }
+        public long LongLineNumber { get; }
 
         public MatchRef(ReadOnlySpan<byte> line, int matchStartIndex, int matchLength, int lineNumber)
         {
@@ -19,6 +20,16 @@ namespace Glacier.Grep
             MatchStartIndex = matchStartIndex;
             MatchLength = matchLength;
             LineNumber = lineNumber;
+            LongLineNumber = lineNumber;
+        }
+
+        public MatchRef(ReadOnlySpan<byte> line, int matchStartIndex, int matchLength, long lineNumber)
+        {
+            Line = line;
+            MatchStartIndex = matchStartIndex;
+            MatchLength = matchLength;
+            LineNumber = lineNumber > int.MaxValue ? int.MaxValue : (int)lineNumber;
+            LongLineNumber = lineNumber;
         }
     }
 
@@ -45,6 +56,7 @@ namespace Glacier.Grep
     {
         public string FilePath { get; set; } = string.Empty;
         public int LineNumber { get; set; }
+        public long LongLineNumber { get; set; }
         public string MatchContent { get; set; } = string.Empty;
         public int MatchStartIndex { get; set; }
         public int MatchLength { get; set; }

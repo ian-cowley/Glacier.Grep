@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace Glacier.Grep.Host.Mcp
@@ -14,6 +16,8 @@ namespace Glacier.Grep.Host.Mcp
     /// </summary>
     public class McpServer
     {
+        private static readonly string ServerVersion = ResolveServerVersion();
+
         private readonly StreamReader _reader;
         private readonly StreamWriter _writer;
         private readonly string? _logPath;
@@ -36,6 +40,19 @@ namespace Glacier.Grep.Host.Mcp
             _writer = new StreamWriter(output, new UTF8Encoding(false), bufferSize: 4096, leaveOpen: true) { AutoFlush = true, NewLine = "\n" };
         }
 
+        private static string ResolveServerVersion()
+        {
+            Assembly assembly = typeof(McpServer).Assembly;
+            string? infoVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            if (!string.IsNullOrWhiteSpace(infoVersion))
+            {
+                int plusIdx = infoVersion.IndexOf('+');
+                return plusIdx >= 0 ? infoVersion.Substring(0, plusIdx) : infoVersion;
+            }
+
+            return assembly.GetName().Version?.ToString(3) ?? "1.1.1";
+        }
+
         private void Log(string message)
         {
             if (_logPath == null) return;
@@ -56,60 +73,110 @@ namespace Glacier.Grep.Host.Mcp
                 try
                 {
                     Log($"Received: {line}");
-                    using var doc = JsonDocument.Parse(line);
-                    var root = doc.RootElement;
-
-                    if (!root.TryGetProperty("method", out JsonElement methodElem))
+                    JsonDocument doc;
+                    try
                     {
-                        Log("Invalid message: missing 'method' property.");
+                        doc = JsonDocument.Parse(line);
+                    }
+                    catch (JsonException)
+                    {
+                        await SendErrorAsync(default, -32700, "Parse error: invalid JSON.");
                         continue;
                     }
 
-                    string method = methodElem.GetString() ?? string.Empty;
-                    if (root.TryGetProperty("id", out JsonElement rawId))
+                    using (doc)
                     {
-                        requestId = rawId.Clone();
+                        var root = doc.RootElement;
+                        if (root.ValueKind != JsonValueKind.Object)
+                        {
+                            await SendErrorAsync(default, -32600, "Invalid Request: JSON-RPC request must be a JSON object.");
+                            continue;
+                        }
+
+                        if (root.TryGetProperty("id", out JsonElement rawId))
+                        {
+                            if (rawId.ValueKind is not (JsonValueKind.String or JsonValueKind.Number or JsonValueKind.Null))
+                            {
+                                await SendErrorAsync(default, -32600, "Invalid Request: 'id' must be a string, number, or null.");
+                                continue;
+                            }
+                            requestId = rawId.Clone();
+                        }
+
+                        if (!root.TryGetProperty("method", out JsonElement methodElem) ||
+                            methodElem.ValueKind != JsonValueKind.String ||
+                            string.IsNullOrWhiteSpace(methodElem.GetString()))
+                        {
+                            await SendErrorAsync(requestId, -32600, "Invalid Request: missing or invalid 'method' property.");
+                            continue;
+                        }
+
+                        string method = methodElem.GetString()!;
+
+                        switch (method)
+                        {
+                            case "initialize":
+                                await SendInitializeResponseAsync(requestId, HandleInitialize());
+                                break;
+
+                            case "notifications/initialized":
+                                Log("Client initialization confirmed.");
+                                break;
+
+                            case "tools/list":
+                                await SendToolsListResponseAsync(requestId, HandleToolsList());
+                                break;
+
+                            case "tools/call":
+                                if (!root.TryGetProperty("params", out JsonElement parameters) || parameters.ValueKind != JsonValueKind.Object)
+                                {
+                                    await SendErrorAsync(requestId, -32602, "Invalid params: 'params' must be a JSON object.");
+                                }
+                                else
+                                {
+                                    var result = await HandleToolCallAsync(parameters);
+                                    await SendToolCallResponseAsync(requestId, result);
+                                }
+                                break;
+
+                            default:
+                                Log($"Unhandled method: {method}");
+                                if (requestId.ValueKind != JsonValueKind.Undefined)
+                                {
+                                    await SendErrorAsync(requestId, -32601, $"Method '{method}' not implemented.");
+                                }
+                                break;
+                        }
                     }
-
-                    switch (method)
+                }
+                catch (McpInvalidParamsException ex)
+                {
+                    Log($"Invalid params: {ex.Message}");
+                    if (requestId.ValueKind != JsonValueKind.Undefined)
                     {
-                        case "initialize":
-                            await SendInitializeResponseAsync(requestId, HandleInitialize());
-                            break;
-
-                        case "notifications/initialized":
-                            Log("Client initialization confirmed.");
-                            break;
-
-                        case "tools/list":
-                            await SendToolsListResponseAsync(requestId, HandleToolsList());
-                            break;
-
-                        case "tools/call":
-                            if (root.TryGetProperty("params", out JsonElement parameters))
-                            {
-                                var result = await HandleToolCallAsync(parameters);
-                                await SendToolCallResponseAsync(requestId, result);
-                            }
-                            else
-                            {
-                                await SendErrorAsync(requestId, -32602, "Parameters missing for tools/call");
-                            }
-                            break;
-
-                        default:
-                            Log($"Unhandled method: {method}");
-                            if (requestId.ValueKind != JsonValueKind.Undefined && requestId.ValueKind != JsonValueKind.Null)
-                            {
-                                await SendErrorAsync(requestId, -32601, $"Method '{method}' not implemented.");
-                            }
-                            break;
+                        await SendErrorAsync(requestId, -32602, ex.Message);
+                    }
+                }
+                catch (RegexParseException ex)
+                {
+                    Log($"Invalid regex: {ex.Message}");
+                    if (requestId.ValueKind != JsonValueKind.Undefined)
+                    {
+                        await SendErrorAsync(requestId, -32602, $"Invalid regex pattern: {ex.Message}");
+                    }
+                }
+                catch (ArgumentException ex)
+                {
+                    Log($"Invalid argument: {ex.Message}");
+                    if (requestId.ValueKind != JsonValueKind.Undefined)
+                    {
+                        await SendErrorAsync(requestId, -32602, ex.Message);
                     }
                 }
                 catch (Exception ex)
                 {
                     Log($"CRITICAL error: {ex.Message}");
-                    if (requestId.ValueKind != JsonValueKind.Undefined && requestId.ValueKind != JsonValueKind.Null)
+                    if (requestId.ValueKind != JsonValueKind.Undefined)
                     {
                         try { await SendErrorAsync(requestId, -32603, $"Internal Server Error: {ex.Message}"); } catch { }
                     }
@@ -121,7 +188,7 @@ namespace Glacier.Grep.Host.Mcp
         {
             ProtocolVersion = "2024-11-05",
             Capabilities = new McpCapabilities { Tools = new McpToolsCapability { ListChanged = false } },
-            ServerInfo = new McpServerInfo { Name = "Glacier.Grep", Version = "1.1.0" }
+            ServerInfo = new McpServerInfo { Name = "Glacier.Grep", Version = ServerVersion }
         };
 
         private static McpToolsListResult HandleToolsList() => new()
@@ -159,45 +226,57 @@ namespace Glacier.Grep.Host.Mcp
             ]
         };
 
-        private async Task<McpToolResponse> HandleToolCallAsync(JsonElement parameters)
+        private static async Task<McpToolResponse> HandleToolCallAsync(JsonElement parameters)
         {
-            string toolName = parameters.GetProperty("name").GetString() ?? string.Empty;
-            JsonElement arguments = parameters.GetProperty("arguments");
-
-            if (toolName == "search_grep")
+            if (!parameters.TryGetProperty("name", out JsonElement nameElem) ||
+                nameElem.ValueKind != JsonValueKind.String ||
+                string.IsNullOrWhiteSpace(nameElem.GetString()))
             {
-                string query = arguments.GetProperty("query").GetString() ?? throw new ArgumentException("Missing 'query' parameter");
+                throw new McpInvalidParamsException("Invalid params: 'name' must be a non-empty string.");
+            }
 
-                string searchDir = arguments.TryGetProperty("path", out JsonElement pathElem)
-                    ? pathElem.GetString() ?? Directory.GetCurrentDirectory()
-                    : Directory.GetCurrentDirectory();
+            string toolName = nameElem.GetString()!;
+            if (!string.Equals(toolName, "search_grep", StringComparison.Ordinal))
+            {
+                throw new McpInvalidParamsException($"Tool '{toolName}' is not supported.");
+            }
 
-                bool isRegex = arguments.TryGetProperty("isRegex", out JsonElement regexElem) && regexElem.GetBoolean();
-                bool caseSensitive = arguments.TryGetProperty("caseSensitive", out JsonElement caseElem) && caseElem.GetBoolean();
-                int contextLines = arguments.TryGetProperty("contextLines", out JsonElement contextElem) ? contextElem.GetInt32() : 2;
-                bool searchHidden = arguments.TryGetProperty("searchHidden", out JsonElement hiddenElem) && hiddenElem.GetBoolean();
-                bool searchBinary = arguments.TryGetProperty("searchBinary", out JsonElement binaryElem) && binaryElem.GetBoolean();
-                bool invertMatch = arguments.TryGetProperty("invertMatch", out JsonElement invertElem) && invertElem.GetBoolean();
-                int? maxDepth = arguments.TryGetProperty("maxDepth", out JsonElement depthElem) ? depthElem.GetInt32() : null;
+            if (!parameters.TryGetProperty("arguments", out JsonElement arguments) ||
+                arguments.ValueKind != JsonValueKind.Object)
+            {
+                throw new McpInvalidParamsException("Invalid params: 'arguments' must be a JSON object.");
+            }
 
-                string[]? fileGlobs = null;
-                if (arguments.TryGetProperty("fileGlobs", out JsonElement globsElem) && globsElem.ValueKind == JsonValueKind.Array)
-                {
-                    var globsList = new List<string>();
-                    foreach (var item in globsElem.EnumerateArray())
-                    {
-                        if (item.GetString() is { } glob) globsList.Add(glob);
-                    }
-                    fileGlobs = globsList.ToArray();
-                }
+            if (!arguments.TryGetProperty("query", out JsonElement queryElem) ||
+                queryElem.ValueKind != JsonValueKind.String)
+            {
+                throw new McpInvalidParamsException("Invalid params: 'query' must be a string.");
+            }
 
-                if (!Directory.Exists(searchDir))
-                {
-                    return CreateToolResponse($"Directory not found: {searchDir}");
-                }
+            string query = queryElem.GetString() ?? throw new McpInvalidParamsException("Invalid params: 'query' must be a string.");
+            string searchDir = GetOptionalNullableString(arguments, "path") is { Length: > 0 } configuredPath
+                ? configuredPath
+                : Directory.GetCurrentDirectory();
 
-                var engine = new SearchEngine(searchDir);
-                var matches = await engine.SearchAsync(
+            bool isRegex = GetOptionalBoolean(arguments, "isRegex", defaultValue: false);
+            bool caseSensitive = GetOptionalBoolean(arguments, "caseSensitive", defaultValue: false);
+            int contextLines = GetOptionalNonNegativeInt32(arguments, "contextLines", defaultValue: 2);
+            bool searchHidden = GetOptionalBoolean(arguments, "searchHidden", defaultValue: false);
+            bool searchBinary = GetOptionalBoolean(arguments, "searchBinary", defaultValue: false);
+            bool invertMatch = GetOptionalBoolean(arguments, "invertMatch", defaultValue: false);
+            int? maxDepth = GetOptionalNullableNonNegativeInt32(arguments, "maxDepth");
+            string[]? fileGlobs = GetOptionalNullableStringArray(arguments, "fileGlobs");
+
+            if (!Directory.Exists(searchDir))
+            {
+                return CreateToolResponse($"Directory not found: {searchDir}");
+            }
+
+            var engine = new SearchEngine(searchDir);
+            List<SearchResult> matches;
+            try
+            {
+                matches = await engine.SearchAsync(
                     query,
                     isRegex,
                     caseSensitive,
@@ -207,23 +286,107 @@ namespace Glacier.Grep.Host.Mcp
                     searchBinary,
                     invertMatch,
                     maxDepth);
-
-                const int maxResults = 250;
-                if (matches.Count > maxResults)
-                {
-                    var truncated = matches.GetRange(0, maxResults);
-                    string truncatedJson = JsonSerializer.Serialize(truncated, McpJsonContext.Default.ListSearchResult);
-                    string summary = $"Showing first {maxResults} out of {matches.Count} matches found.\n\n" + truncatedJson;
-                    return CreateToolResponse(summary);
-                }
-                else
-                {
-                    string resultsJson = JsonSerializer.Serialize(matches, McpJsonContext.Default.ListSearchResult);
-                    return CreateToolResponse(resultsJson);
-                }
+            }
+            catch (NotSupportedException ex) when (isRegex)
+            {
+                throw new McpInvalidParamsException($"Unsupported regex pattern: {ex.Message}");
             }
 
-            throw new ArgumentException($"Tool '{toolName}' is not supported.");
+            const int maxResults = 250;
+            if (matches.Count > maxResults)
+            {
+                var truncated = matches.GetRange(0, maxResults);
+                string truncatedJson = JsonSerializer.Serialize(truncated, McpJsonContext.Default.ListSearchResult);
+                string summary = $"Showing first {maxResults} out of {matches.Count} matches found.\n\n" + truncatedJson;
+                return CreateToolResponse(summary);
+            }
+
+            string resultsJson = JsonSerializer.Serialize(matches, McpJsonContext.Default.ListSearchResult);
+            return CreateToolResponse(resultsJson);
+        }
+
+        private static string? GetOptionalNullableString(JsonElement arguments, string propertyName)
+        {
+            if (!arguments.TryGetProperty(propertyName, out JsonElement elem) || elem.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+
+            if (elem.ValueKind != JsonValueKind.String)
+            {
+                throw new McpInvalidParamsException($"Invalid params: '{propertyName}' must be a string or null.");
+            }
+
+            return elem.GetString();
+        }
+
+        private static bool GetOptionalBoolean(JsonElement arguments, string propertyName, bool defaultValue)
+        {
+            if (!arguments.TryGetProperty(propertyName, out JsonElement elem))
+            {
+                return defaultValue;
+            }
+
+            return elem.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => throw new McpInvalidParamsException($"Invalid params: '{propertyName}' must be a boolean.")
+            };
+        }
+
+        private static int GetOptionalNonNegativeInt32(JsonElement arguments, string propertyName, int defaultValue)
+        {
+            if (!arguments.TryGetProperty(propertyName, out JsonElement elem))
+            {
+                return defaultValue;
+            }
+
+            if (elem.ValueKind != JsonValueKind.Number || !elem.TryGetInt32(out int value) || value < 0)
+            {
+                throw new McpInvalidParamsException($"Invalid params: '{propertyName}' must be a non-negative 32-bit integer.");
+            }
+
+            return value;
+        }
+
+        private static int? GetOptionalNullableNonNegativeInt32(JsonElement arguments, string propertyName)
+        {
+            if (!arguments.TryGetProperty(propertyName, out JsonElement elem) || elem.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+
+            if (elem.ValueKind != JsonValueKind.Number || !elem.TryGetInt32(out int value) || value < 0)
+            {
+                throw new McpInvalidParamsException($"Invalid params: '{propertyName}' must be a non-negative 32-bit integer or null.");
+            }
+
+            return value;
+        }
+
+        private static string[]? GetOptionalNullableStringArray(JsonElement arguments, string propertyName)
+        {
+            if (!arguments.TryGetProperty(propertyName, out JsonElement elem) || elem.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+
+            if (elem.ValueKind != JsonValueKind.Array)
+            {
+                throw new McpInvalidParamsException($"Invalid params: '{propertyName}' must be an array of strings or null.");
+            }
+
+            var list = new List<string>();
+            foreach (JsonElement item in elem.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String || item.GetString() is not { } glob)
+                {
+                    throw new McpInvalidParamsException($"Invalid params: every element in '{propertyName}' must be a string.");
+                }
+                list.Add(glob);
+            }
+            return list.ToArray();
         }
 
         private static McpToolResponse CreateToolResponse(string text) => new()
@@ -274,6 +437,8 @@ namespace Glacier.Grep.Host.Mcp
             string json = JsonSerializer.Serialize(envelope, McpJsonContext.Default.McpJsonRpcErrorResponse);
             return _writer.WriteLineAsync(json);
         }
+
+        private sealed class McpInvalidParamsException(string message) : Exception(message);
     }
 
     public sealed class McpJsonRpcInitializeResponse
@@ -324,7 +489,7 @@ namespace Glacier.Grep.Host.Mcp
     public sealed class McpServerInfo
     {
         [JsonPropertyName("name")] public string Name { get; set; } = "Glacier.Grep";
-        [JsonPropertyName("version")] public string Version { get; set; } = "1.1.0";
+        [JsonPropertyName("version")] public string Version { get; set; } = "1.1.1";
     }
 
     public sealed class McpToolsListResult

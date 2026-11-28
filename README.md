@@ -11,17 +11,17 @@
 [![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
 
-**Glacier.Grep** is a native, high-performance, zero-allocation C# search engine and index for .NET 10. Built to take on `ripgrep` within the Glacier ecosystem, it provides aggressive hardware acceleration (SIMD), concurrent work-stealing directory scanning, and built-in support for the Model Context Protocol (MCP).
+**Glacier.Grep** is a native, high-performance, low-allocation C# search engine for .NET 10. Built for the Glacier ecosystem, it combines hardware-accelerated SIMD UTF-8 scanning, bounded-channel concurrent directory scanning, and built-in support for the Model Context Protocol (MCP). (Glacier.Grep scans files directly without maintaining a persistent search index.)
 
 ---
 
 ## Key Features
 
-*   🚀 **SIMD-Accelerated Hot Path**: Utilizes hardware-accelerated set searching via .NET 10 `SearchValues<byte>` and auto-vectorized scanning on raw UTF-8 bytes without string conversions.
-*   📂 **Lock-Free Directory Enumeration**: Implements custom `FileSystemEnumerable` checking which evaluates file metadata (hidden status, symlinks) and ignore matches entirely on the stack before materializing path strings.
-*   ⚙️ **Advanced Ignore File Support**: Evaluates rules from `.gitignore`, `.ignore`, and `.rgignore` hierarchically, matching `ripgrep`'s prioritized exclusion behavior.
-*   ⚡ **Hybrid I/O Dispatcher**: Automatically routes files based on size (using zero-copy Memory-Mapped Files for >1MB and RandomAccess read into `ArrayPool<byte>` for <1MB).
-*   🔍 **Zero-Allocation Regex Matching**: Leverages .NET JIT-compiled regex engines with `Regex.EnumerateMatches(ReadOnlySpan<char>)` for zero heap allocation searches.
+*   🚀 **SIMD-Accelerated Hot Path**: Uses .NET 10 `SearchValues<byte>`, `ReadOnlySpan<byte>.IndexOf`, and `Vector128`/`Vector256`/`Vector512` scanning on raw UTF-8 bytes for case-sensitive, case-insensitive, inverted, and `ClassifyPatternFull`-lowered literal/anchored regexes.
+*   📂 **Low-Allocation Directory Enumeration**: Implements custom `FileSystemEnumerable` traversal that evaluates file metadata (hidden/system attributes) and ignore rules using stack-allocated and pooled `Span<char>` buffers.
+*   ⚙️ **Hierarchical Ignore File Support**: Evaluates rules from `.gitignore`, `.ignore`, and `.rgignore` hierarchically within the search root (supporting basic wildcards, `!` negation, and `/` directory/rooted rules; `**` globstar, character classes, and backslash escapes are not implemented).
+*   ⚡ **Hybrid I/O Dispatcher**: Automatically routes files based on size using per-chunk sliding `MemoryMappedFile` views for files >= 1 MB (or > `MaxChunkSize`) and `RandomAccess` read loops into `ArrayPool<byte>` for files < 1 MB.
+*   🔍 **Linear-Time Regex Matching**: Uses `RegexOptions.NonBacktracking` with `Regex.EnumerateMatches(ReadOnlySpan<char>)` over pooled `ArrayPool<char>` chunk buffers for general patterns, while lowering eligible literal/anchored regexes directly to UTF-8 byte scans.
 *   🤖 **MCP Server Support**: Built-in support for the Model Context Protocol, allowing seamless integration with AI agents and tools.
 
 ---
@@ -102,39 +102,27 @@ Add the following entry to your `mcp_config.json`:
 
 ---
 
-## Performance
+## Architecture & I/O Design
 
-Glacier.Grep is engineered in pure C# .NET 10 to saturate CPU memory bandwidth. On exact case-sensitive code symbol searches, Glacier.Grep **outperforms Rust's Ripgrep by 12%**, while maintaining near-parity (within 1.2x–1.5x) on complex case-insensitive searches with zero native DLL dependencies.
+Glacier.Grep is engineered in pure C# .NET 10 with zero native DLL dependencies. Note that no standalone benchmark suite is currently shipped in this repository.
 
-### Benchmark: Full Glacier / PolarsPlus Repository Search
-- **Target Corpus**: 590 files, 257.83 MB
-- **Platform**: Windows x64, AMD Ryzen AI 9 HX 370
+### File-Backed Memory Mapping & Bounded Sliding Views
+For files >= 1 MB (or exceeding `HybridIoDispatcher.MaxChunkSize`), `HybridIoDispatcher` maps files directly from the OS page cache via file-backed `MemoryMappedFile.CreateFromFile` and slides bounded per-chunk `MemoryMappedViewAccessor` windows (defaulting to 16 MB UTF-8 codepoint-aligned chunks plus overlap and 64 KB newline lookahead), avoiding single whole-file mappings and multi-gigabyte regex decode buffers. For files < 1 MB, `HybridIoDispatcher` reads via `RandomAccess.Read` loops into pooled `ArrayPool<byte>` buffers and handles files whose size changes between enumeration and read.
 
-| Search Query | Match Mode | Ripgrep (Rust) | Glacier.Grep (.NET 10) | Result |
-| :--- | :--- | :---: | :---: | :--- |
-| `"public class"` | Case-Sensitive | 134.9 ms | **120.4 ms** | 🚀 **Glacier is 12% FASTER** |
-| `"ThreadIndependentReaderWriterLock"` | Case-Insensitive | **115.7 ms** | 142.3 ms | ⚡ **Near-Parity** (within 1.23x of Rust) |
-| `"public class"` | Case-Insensitive | **137.9 ms** | 210.4 ms | 🔹 Ripgrep leads (within 1.52x of Rust) |
-
-### File-Backed Memory Mapping & Bounded Chunking
-For files >= 1 MB, HybridIoDispatcher maps files directly from the OS page cache via file-backed MemoryMappedFile.CreateFromFile using 16 MB UTF-8 codepoint-aligned windows, avoiding swap-backed copies and multi-gigabyte regex decode buffers.
+1.  **Directory Traverser**: Low-allocation metadata filtration. Prunes ignored folders (like `.git`, `node_modules`, `bin/`, `obj/`) and applies `.gitignore`, `.ignore`, and `.rgignore` rules.
+2.  **Hybrid I/O Dispatcher**: Routes files < 1 MB through `RandomAccess` pooled reads and files >= 1 MB through sliding `MemoryMappedFile` views.
+3.  **Search Core**: Evaluates raw UTF-8 `ReadOnlySpan<byte>` via `SearchValues<byte>`, `Vector128`/`Vector256`/`Vector512` case-insensitive anchors, `ClassifyPatternFull` regex lowering, and `RegexOptions.NonBacktracking` fallback.
+4.  **MCP Integration**: Exposes search capabilities over standard stdio JSON-RPC with strict `-32700`/`-32600`/`-32602` validation.
 
 ---
 
-## Architecture
+## 🆕 What's New in v1.1.1
 
-1.  **Directory Traverser**: Zero-allocation metadata filtration. Prunes ignored folders (like `.git`, `node_modules`, `bin/`) and applies `.gitignore`, `.ignore`, and `.rgignore` rules.
-2.  **Hybrid I/O Dispatcher**: Chooses the fastest reading technique depending on file size.
-3.  **Search Core**: Evaluates the bytes using `ReadOnlySpan<byte>` and JIT vectorization.
-4.  **MCP Integration**: Integrates the search capabilities over standard stdio JSON-RPC.
-
----
-
-## 🆕 What's New in v1.1.0
-
-- **Genuine file-backed memory mapping & UTF-8 codepoint-safe 16 MB chunking** — eliminates anonymous swap copies, multi-GB regex char[] allocations, and split UTF-8 codepoints at chunk boundaries.
-- **100% Native AOT MCP Server** — strongly-typed source-generated McpJsonContext JSON-RPC envelopes for initialize, 	ools/list, and 	ools/call with end-to-end tests.
-- **Accurate directory traversal** — removed hardcoded skipping of legitimate elease/ folders and RELEASE files.
+- **Genuine file-backed memory mapping & per-chunk sliding views** — replaces full-file single-view mappings with per-chunk sliding `MemoryMappedViewAccessor` windows and adds `< 1 MB` `RandomAccess` read loops resilient to stale/0-byte/growing lengths.
+- **Cross-chunk regex, long-line inverted streaming & UTF-16 offset parity** — fixes non-newline boundary regex drops, supports lines `> MaxChunkSize` in `invertMatch` mode, and aligns `MatchStartIndex`/`MatchLength` to UTF-16 `MatchContent` indices.
+- **SIMD multi-byte case-insensitive search & Opt #12 `ClassifyPatternFull`** — adds `Vector512`/`Vector256`/`Vector128` 2-anchor + rarest-byte `SearchValues<byte>` scanning and lowers eligible literal/anchored regexes directly to UTF-8 byte scans.
+- **100% Native AOT MCP Server (`v1.1.1`)** — strongly-typed source-generated `McpJsonContext` JSON-RPC envelopes for `initialize`, `tools/list`, and `tools/call` with strict `-32602` parameter validation.
+- **Accurate directory traversal** — removed hardcoded skipping of legitimate `release/` folders and `RELEASE` files.
 
 ---
 
@@ -150,7 +138,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## ❄️ Glacier Ecosystem & Support
 
-Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, zero-allocation developer tooling and data engines natively built for modern C# and .NET 10.
+Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, low-allocation developer tooling and data engines natively built for modern C# and .NET 10.
 
 * 🌐 **Website & Documentation**: [glaciersoftware.dev](https://glaciersoftware.dev/)
 * ☕ **Buy Me a Coffee**: [buymeacoffee.com/glaciersoftware](https://buymeacoffee.com/glaciersoftware)

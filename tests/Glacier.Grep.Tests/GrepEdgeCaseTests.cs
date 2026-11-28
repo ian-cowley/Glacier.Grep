@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Glacier.Grep;
 using Xunit;
 
+[Collection("MaxChunkSizeTests")]
 public class GrepEdgeCaseTests : IDisposable
 {
     private readonly string _tempDir;

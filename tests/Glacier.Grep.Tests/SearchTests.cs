@@ -8,6 +8,7 @@ using Xunit;
 
 namespace Glacier.Grep.Tests
 {
+    [Collection("MaxChunkSizeTests")]
     public class SearchTests : IDisposable
     {
         private readonly string _tempDir;
